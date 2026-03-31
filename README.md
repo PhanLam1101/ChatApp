@@ -57,6 +57,7 @@ After you sign in or register, the application may open an additional console wi
 
 Do not close the C++ program window while the application is running. If it is closed, the chat app may stop working correctly. If this happens, close the application and start it again.
 
+The Server and the Client should be under the same network (LAN). If not, a Virtual LAN could be used to run the app.
 ## Troubleshooting
 
 If you have trouble starting or using the application, try the following:
