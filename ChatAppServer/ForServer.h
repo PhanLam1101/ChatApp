@@ -13,8 +13,8 @@
 
 
 using namespace std;
-unordered_map<string, string>GetAccounts(string file_account);
-unordered_map<string, string>GetAccounts(string file_account)
+inline unordered_map<string, string> GetAccounts(string file_account);
+inline unordered_map<string, string> GetAccounts(string file_account)
 {
 	ifstream File;
 	unordered_map<string, string>Account;
@@ -35,13 +35,13 @@ unordered_map<string, string>GetAccounts(string file_account)
 	}*/
 	return Account;
 }
-std::string ToLower(const std::string& str) {
+inline std::string ToLower(const std::string& str) {
 	std::string lower = str;
 	std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
 	return lower;
 }
 
-std::string GetConversationFileName(const std::string& person1, const std::string& person2) {
+inline std::string GetConversationFileName(const std::string& person1, const std::string& person2) {
 	std::string lower1 = ToLower(person1);
 	std::string lower2 = ToLower(person2);
 	return (lower1 > lower2)
@@ -55,12 +55,12 @@ std::string GetConversationFileName(const std::string& person1, const std::strin
 //		? (person1 + "-" + person2)
 //		: (person2 + "-" + person1);
 //}
-std::string ioContextToString(boost::asio::io_context& io_context) {
+inline std::string ioContextToString(boost::asio::io_context& io_context) {
 	std::ostringstream oss;
 	oss << "IO Context: " << &io_context;  // Print the address for debugging
 	return oss.str();
 }
-std::string socketToString(boost::asio::ip::tcp::socket& socket) {
+inline std::string socketToString(boost::asio::ip::tcp::socket& socket) {
 	std::ostringstream oss;
 	try {
 		auto local_endpoint = socket.local_endpoint();
@@ -76,7 +76,7 @@ std::string socketToString(boost::asio::ip::tcp::socket& socket) {
 	}
 	return oss.str();
 }
-std::string acceptorToString(boost::asio::ip::tcp::acceptor& acceptor) {
+inline std::string acceptorToString(boost::asio::ip::tcp::acceptor& acceptor) {
 	std::ostringstream oss;
 	try {
 		auto local_endpoint = acceptor.local_endpoint();

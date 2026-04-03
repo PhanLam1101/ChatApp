@@ -23,7 +23,7 @@ namespace MessagingApp
             this.FormBorderStyle = FormBorderStyle.FixedDialog;
             this.MaximizeBox = false;
             this.MinimizeBox = false;
-            string iconPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "app-icon1.ico");
+            string iconPath = AppPaths.AppIconFile;
             if (File.Exists(iconPath))
             {
                 this.Icon = new Icon(iconPath);
@@ -168,23 +168,27 @@ namespace MessagingApp
 
         private bool ChangeUserPassword(string currentPassword, string newPassword)
         {
-            string nameFile = "change_password.bin";
+            string nameFile = AppPaths.ChangePasswordRequestFile;
             string passwordFile = currentPassword + "\n" + newPassword;
 
             File.WriteAllText(nameFile, passwordFile);
-            if (PipeConnectionManager.PipeWriter != null)
+            StreamWriter? pipeWriter = PipeConnectionManager.PipeWriter;
+            if (pipeWriter != null)
             {
-                PipeConnectionManager.PipeWriter.WriteLine("CHANGE_PASSWORD");
-                PipeConnectionManager.PipeWriter.Flush();
+                pipeWriter.WriteLine("CHANGE_PASSWORD");
+                pipeWriter.Flush();
             }
             else
             {
-                File.Delete(nameFile);
+                if (File.Exists(nameFile))
+                {
+                    File.Delete(nameFile);
+                }
                 MessageBox.Show("Pipe connection is not established.");
                 return false;
             }
 
-            string resultFilePath = "change_password_result.bin";
+            string resultFilePath = AppPaths.ChangePasswordResultFile;
             Thread.Sleep(500);
             if (File.Exists(resultFilePath))
             {

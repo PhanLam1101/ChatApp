@@ -11,8 +11,10 @@
 #include <mutex>
 #include <condition_variable>
 #include <queue>
+#include <deque>
 #include <chrono>
 #include <ctime>
+#include <cstdlib>
 #include "Tool.h"
 #include "Security.h"
 #include <atomic>
@@ -24,6 +26,9 @@ namespace fs = boost::filesystem;
 namespace fss = std::filesystem;
 const int PORT = 80;
 const int BUFFER_SIZE = 4096;
+const std::string ChatBotContactName = "ChatBot";
+const std::string DefaultChatBotModel = "gemma3:1b";
+const std::string MessageMetadataPrefix = "[#META#]";
 std::queue<std::string> commandQueue;
 std::mutex mtx;
 std::condition_variable cv;
@@ -35,8 +40,180 @@ bool isReceiving = false;  // Global or member variable to track the state of as
 boost::asio::io_context io_context;
 std::atomic<bool> stop_asynch_reading_;
 bool isReceivingAllowed = true;  // Flag to control whether async receive should be active
-HANDLE hNotificationPipe;
-enum MessageType { TEXT = 1, UPDATE_Message = 2, File = 3, UPDATE_File = 4, RECEIVE_TEXT = 5, RECEIVE_File = 6, REGISTRATION = 7, NOT_REGISTRATION = 8, END_UPDATE = 9, REFRESH = 10, ADD_FRIEND = 11, CHANGE_PASSWORD = 12 };
+HANDLE hNotificationPipe = INVALID_HANDLE_VALUE;
+std::atomic<bool> notificationPipeConnected = false;
+std::atomic<bool> notificationPipeAccepting = false;
+std::mutex notificationPipeMutex;
+std::deque<std::string> pendingNotifications;
+enum MessageType { TEXT = 1, UPDATE_Message = 2, File = 3, UPDATE_File = 4, RECEIVE_TEXT = 5, RECEIVE_File = 6, REGISTRATION = 7, NOT_REGISTRATION = 8, END_UPDATE = 9, REFRESH = 10, ADD_FRIEND = 11, CHANGE_PASSWORD = 12, PRESENCE_UPDATE = 13, PUBLIC_KEY_REQUEST = 14, PUBLIC_KEY_SYNC = 15, TYPING_INDICATOR = 16, CLEAR_CHATBOT_MEMORY = 17 };
+void SendSecurityNotification(const std::string& message);
+void SendTypingNotification(const std::string& sender, bool isTyping);
+void SendMessageStatusNotification(const std::string& recipient, const std::string& messageId, const std::string& status);
+void StartNotificationPipeAcceptThread();
+
+std::string ReadEnvironmentVariable(const char* variableName)
+{
+    char* value = nullptr;
+    size_t length = 0;
+    if (_dupenv_s(&value, &length, variableName) != 0 || value == nullptr)
+    {
+        return std::string();
+    }
+
+    std::string result(value);
+    std::free(value);
+    return result;
+}
+
+std::filesystem::path GetProfilesRootPath()
+{
+    std::string configuredRoot = ReadEnvironmentVariable("MESSAGINGAPP_PROFILES_ROOT");
+    if (!configuredRoot.empty())
+    {
+        return std::filesystem::path(configuredRoot);
+    }
+
+    return std::filesystem::current_path();
+}
+
+bool IsChatBotRecipient(const std::string& recipient)
+{
+    return recipient == ChatBotContactName;
+}
+
+std::string LoadSelectedChatBotModel()
+{
+    std::ifstream modelFile("SelectedChatBotModel.txt");
+    std::string modelName;
+    if (modelFile.is_open())
+    {
+        std::getline(modelFile, modelName);
+        modelFile.close();
+    }
+
+    if (modelName.empty())
+    {
+        modelName = DefaultChatBotModel;
+    }
+
+    return modelName;
+}
+
+std::string TrimCopy(const std::string& value)
+{
+    size_t start = value.find_first_not_of(" \t\r\n");
+    if (start == std::string::npos)
+    {
+        return std::string();
+    }
+
+    size_t end = value.find_last_not_of(" \t\r\n");
+    return value.substr(start, end - start + 1);
+}
+
+std::string EncodeNotificationComponent(const std::string& value)
+{
+    static const char hex_digits[] = "0123456789ABCDEF";
+    std::string encoded;
+    encoded.reserve(value.size() * 2);
+    for (unsigned char character : value)
+    {
+        encoded.push_back(hex_digits[(character >> 4) & 0x0F]);
+        encoded.push_back(hex_digits[character & 0x0F]);
+    }
+
+    return encoded;
+}
+
+bool TryGetMessageMetadataValue(const std::string& message, const std::string& key, std::string& value)
+{
+    std::istringstream stream(message);
+    std::string line;
+    const std::string prefix = MessageMetadataPrefix + key + "=";
+    while (std::getline(stream, line))
+    {
+        std::string trimmed = TrimCopy(line);
+        if (trimmed.rfind(prefix, 0) == 0)
+        {
+            value = trimmed.substr(prefix.size());
+            return true;
+        }
+    }
+
+    return false;
+}
+
+void EnsureFileExists(const std::filesystem::path& filePath)
+{
+    if (std::filesystem::exists(filePath))
+    {
+        return;
+    }
+
+    std::filesystem::create_directories(filePath.parent_path());
+    std::ofstream(filePath.string()).close();
+}
+
+void CopyFileIfMissing(const std::filesystem::path& sourcePath, const std::filesystem::path& targetPath)
+{
+    if (!std::filesystem::exists(sourcePath) || std::filesystem::exists(targetPath))
+    {
+        return;
+    }
+
+    std::filesystem::create_directories(targetPath.parent_path());
+    std::filesystem::copy_file(sourcePath, targetPath, std::filesystem::copy_options::skip_existing);
+}
+
+void MergeDirectoryIfExists(const std::filesystem::path& sourcePath, const std::filesystem::path& targetPath)
+{
+    if (!std::filesystem::exists(sourcePath))
+    {
+        return;
+    }
+
+    std::filesystem::create_directories(targetPath);
+    std::filesystem::copy(
+        sourcePath,
+        targetPath,
+        std::filesystem::copy_options::recursive | std::filesystem::copy_options::skip_existing);
+}
+
+void MigrateLegacyUserWorkspace(const std::string& user_id)
+{
+    std::filesystem::path sharedRoot = GetProfilesRootPath().parent_path();
+    std::filesystem::path profileRoot = GetProfilesRootPath() / user_id;
+
+    CopyFileIfMissing(sharedRoot / "Friend_List.txt", profileRoot / "Friend_List.txt");
+    CopyFileIfMissing(sharedRoot / "UnaddedContact.txt", profileRoot / "UnaddedContact.txt");
+    MergeDirectoryIfExists(sharedRoot / "Conversations", profileRoot / "Conversations");
+    MergeDirectoryIfExists(sharedRoot / "Templates", profileRoot / "Templates");
+    MergeDirectoryIfExists(sharedRoot / "Downloads", profileRoot / "Downloads");
+    MergeDirectoryIfExists(sharedRoot / "Keys" / user_id, profileRoot / "Keys");
+}
+
+bool SwitchToUserProfileWorkspace(const std::string& user_id)
+{
+    try
+    {
+        std::filesystem::path profileRoot = GetProfilesRootPath() / user_id;
+        MigrateLegacyUserWorkspace(user_id);
+        std::filesystem::create_directories(profileRoot / "Conversations");
+        std::filesystem::create_directories(profileRoot / "Downloads");
+        std::filesystem::create_directories(profileRoot / "Templates");
+        EnsureFileExists(profileRoot / "Friend_List.txt");
+        EnsureFileExists(profileRoot / "UnaddedContact.txt");
+        std::filesystem::current_path(profileRoot);
+        std::cout << "Switched helper workspace to: " << profileRoot.string() << std::endl;
+        return true;
+    }
+    catch (const std::exception& exception)
+    {
+        std::cerr << "Failed to switch helper workspace: " << exception.what() << std::endl;
+        return false;
+    }
+}
+
 // ! Encrypt from the third line
 bool registration(tcp::socket& socket) {
     string register_file_name = "register.bin";
@@ -49,6 +226,13 @@ bool registration(tcp::socket& socket) {
         return false;
     }
     register_file >> ID >> password;
+
+    string publicKeyHex;
+    string keyError;
+    if (!EnsureUserKeys(ID, publicKeyHex, keyError)) {
+        cerr << "Failed to prepare encryption keys during registration: " << keyError << endl;
+        return false;
+    }
 
     // Send the message type (REGISTRATION)
     uint32_t message_type = MessageType::REGISTRATION;
@@ -63,6 +247,10 @@ bool registration(tcp::socket& socket) {
 
     boost::asio::write(socket, boost::asio::buffer(&password_length, sizeof(password_length)));
     boost::asio::write(socket, boost::asio::buffer(password));
+
+    uint32_t public_key_length = static_cast<uint32_t>(publicKeyHex.size());
+    boost::asio::write(socket, boost::asio::buffer(&public_key_length, sizeof(public_key_length)));
+    boost::asio::write(socket, boost::asio::buffer(publicKeyHex));
 
     // Wait for the server response
     uint32_t response;
@@ -91,6 +279,10 @@ bool registration(tcp::socket& socket) {
 }
 
 void checkAndAddSender(const std::string& sender) {
+    if (sender == ChatBotContactName) {
+        return;
+    }
+
     std::unordered_set<std::string> contactList;
     std::ifstream friendFile("Friend_List.txt");
 
@@ -165,6 +357,35 @@ void addFriend(tcp::socket& socket) {
 
     // Step 4: Process response and update files accordingly
     if (response == 1) {
+        uint32_t keyLength = 0;
+        boost::asio::read(socket, boost::asio::buffer(&keyLength, sizeof(keyLength)), error);
+        if (error) {
+            std::cerr << "Error receiving contact public-key length: " << error.message() << std::endl;
+            return;
+        }
+
+        std::vector<char> keyBuffer(keyLength);
+        boost::asio::read(socket, boost::asio::buffer(keyBuffer), error);
+        if (error) {
+            std::cerr << "Error receiving contact public key: " << error.message() << std::endl;
+            return;
+        }
+
+        std::string warning_message;
+        std::string cache_error;
+        if (!CacheContactPublicKey(userName, friendName, std::string(keyBuffer.begin(), keyBuffer.end()), warning_message, cache_error)) {
+            std::cerr << "Error caching contact public key: " << cache_error << std::endl;
+            std::ofstream resultFile("add_contact_result.bin");
+            if (resultFile.is_open()) {
+                resultFile << "fail" << std::endl;
+            }
+            return;
+        }
+
+        if (!warning_message.empty()) {
+            SendSecurityNotification(warning_message);
+        }
+
         // Success: Add the friend to "Friend_List.txt" and write "success" to "add_contact_result.txt"
         std::ofstream friendList("Friend_List.txt", std::ios::app);
         if (friendList.is_open()) {
@@ -177,6 +398,14 @@ void addFriend(tcp::socket& socket) {
             resultFile << "success" << std::endl;
             resultFile.close();
         }
+    }
+    else if (response == 2) {
+        std::ofstream resultFile("add_contact_result.bin");
+        if (resultFile.is_open()) {
+            resultFile << "no_key" << std::endl;
+            resultFile.close();
+        }
+        SendSecurityNotification(friendName + " exists, but has not uploaded an encryption key yet.");
     }
     else {
         // Failure: Write "fail" to "add_contact_result.txt"
@@ -236,24 +465,217 @@ void changePassword(tcp::socket& socket, const string& currentPassword, const st
     }
     changeResultFile.close();
 }
+bool WriteNotificationToPipe(const std::string& notification) {
+    std::lock_guard<std::mutex> lock(notificationPipeMutex);
+
+    if (hNotificationPipe == INVALID_HANDLE_VALUE) {
+        std::cerr << "Notification pipe is not initialized." << std::endl;
+        pendingNotifications.push_back(notification);
+        return false;
+    }
+
+    if (!notificationPipeConnected.load()) {
+        pendingNotifications.push_back(notification);
+        StartNotificationPipeAcceptThread();
+        return false;
+    }
+
+    DWORD bytesWritten = 0;
+    if (!WriteFile(hNotificationPipe, notification.c_str(), static_cast<DWORD>(notification.size()), &bytesWritten, NULL)) {
+        DWORD error = GetLastError();
+        std::cerr << "Error writing to notification pipe. Error: " << error << std::endl;
+        pendingNotifications.push_back(notification);
+        if (error == ERROR_BROKEN_PIPE || error == ERROR_NO_DATA) {
+            notificationPipeConnected = false;
+            DisconnectNamedPipe(hNotificationPipe);
+            StartNotificationPipeAcceptThread();
+        }
+        return false;
+    }
+
+    return true;
+}
+
 // Sends a "NEW_MESSAGE" notification through the notification pipe
 void SendNewMessageNotification(const std::string& sender, const std::string& content) {
-    if (ConnectNamedPipe(hNotificationPipe, NULL) || GetLastError() == ERROR_PIPE_CONNECTED) {
-        // Construct the notification string
-        std::string notification = "NEW_MESSAGE:" + sender + ":" + content + "\n"; // Add newline
-        DWORD bytesWritten;
+    std::string notification =
+        "NEW_MESSAGE_HEX:" +
+        EncodeNotificationComponent(sender) +
+        ":" +
+        EncodeNotificationComponent(content) +
+        "\n";
+    if (WriteNotificationToPipe(notification)) {
+        std::cout << "Sent NEW_MESSAGE notification: " << notification << std::endl;
+    }
+}
 
-        // Write the full notification to the pipe
-        if (WriteFile(hNotificationPipe, notification.c_str(), notification.size(), &bytesWritten, NULL)) {
-            std::cout << "Sent NEW_MESSAGE notification: " << notification << std::endl;
-        }
-        else {
-            std::cerr << "Error writing to notification pipe. Error: " << GetLastError() << std::endl;
-        }
+void SendMessageStatusNotification(const std::string& recipient, const std::string& messageId, const std::string& status) {
+    std::string notification = "MESSAGE_STATUS:" + recipient + ":" + messageId + ":" + status + "\n";
+    if (WriteNotificationToPipe(notification)) {
+        std::cout << "Sent MESSAGE_STATUS notification: " << notification << std::endl;
     }
-    else {
-        std::cerr << "Failed to connect to notification pipe. Error: " << GetLastError() << std::endl;
+}
+
+void SendPresenceNotification(const std::string& user_name, bool is_online) {
+    std::string state = is_online ? "online" : "offline";
+    std::string notification = "PRESENCE:" + user_name + ":" + state + "\n";
+    if (WriteNotificationToPipe(notification)) {
+        std::cout << "Sent PRESENCE notification: " << notification << std::endl;
     }
+}
+
+void SendTypingNotification(const std::string& sender, bool isTyping) {
+    std::string state = isTyping ? "start" : "stop";
+    std::string notification = "TYPING:" + sender + ":" + state + "\n";
+    if (WriteNotificationToPipe(notification)) {
+        std::cout << "Sent TYPING notification: " << notification << std::endl;
+    }
+}
+
+void SendSecurityNotification(const std::string& message) {
+    std::string notification = "SECURITY:" + message + "\n";
+    if (WriteNotificationToPipe(notification)) {
+        std::cout << "Sent SECURITY notification: " << notification << std::endl;
+    }
+}
+
+bool PublishCurrentUserPublicKey(tcp::socket& socket, const std::string& user_id, std::string& error_message) {
+    error_message.clear();
+
+    std::string public_key_hex;
+    if (!EnsureUserKeys(user_id, public_key_hex, error_message)) {
+        return false;
+    }
+
+    boost::system::error_code error;
+    uint32_t requestType = MessageType::PUBLIC_KEY_SYNC;
+    boost::asio::write(socket, boost::asio::buffer(&requestType, sizeof(requestType)), error);
+    if (error) {
+        error_message = "Failed to send the public-key sync request: " + error.message();
+        return false;
+    }
+
+    uint32_t keyLength = static_cast<uint32_t>(public_key_hex.size());
+    boost::asio::write(socket, boost::asio::buffer(&keyLength, sizeof(keyLength)), error);
+    if (error) {
+        error_message = "Failed to send the public-key length: " + error.message();
+        return false;
+    }
+
+    boost::asio::write(socket, boost::asio::buffer(public_key_hex), error);
+    if (error) {
+        error_message = "Failed to send the public key: " + error.message();
+        return false;
+    }
+
+    uint32_t response = 0;
+    boost::asio::read(socket, boost::asio::buffer(&response, sizeof(response)), error);
+    if (error || response != 1U) {
+        error_message = error
+            ? "Failed to receive a public-key sync acknowledgement: " + error.message()
+            : "The server rejected the public-key sync request.";
+        return false;
+    }
+
+    return true;
+}
+
+bool EnsureRecipientPublicKey(tcp::socket& socket, const std::string& owner_user, const std::string& recipient, std::string& warning_message, std::string& error_message) {
+    warning_message.clear();
+    error_message.clear();
+
+    std::string existing_public_key;
+    bool has_cached_key = LoadContactPublicKey(owner_user, recipient, existing_public_key, error_message);
+    error_message.clear();
+
+    boost::system::error_code error;
+    uint32_t requestType = MessageType::PUBLIC_KEY_REQUEST;
+    boost::asio::write(socket, boost::asio::buffer(&requestType, sizeof(requestType)), error);
+    if (error) {
+        if (has_cached_key) {
+            warning_message = "Could not refresh " + recipient + "'s public key from the server. Using the cached key instead.";
+            return true;
+        }
+
+        error_message = "Failed to request " + recipient + "'s public key: " + error.message();
+        return false;
+    }
+
+    uint32_t nameLength = static_cast<uint32_t>(recipient.size());
+    boost::asio::write(socket, boost::asio::buffer(&nameLength, sizeof(nameLength)), error);
+    boost::asio::write(socket, boost::asio::buffer(recipient), error);
+    if (error) {
+        if (has_cached_key) {
+            warning_message = "Could not send a public-key refresh request for " + recipient + ". Using the cached key instead.";
+            return true;
+        }
+
+        error_message = "Failed to send the public-key request payload: " + error.message();
+        return false;
+    }
+
+    uint32_t response = 0;
+    boost::asio::read(socket, boost::asio::buffer(&response, sizeof(response)), error);
+    if (error) {
+        if (has_cached_key) {
+            warning_message = "Could not receive the latest public key for " + recipient + ". Using the cached key instead.";
+            return true;
+        }
+
+        error_message = "Failed to receive the public-key response: " + error.message();
+        return false;
+    }
+
+    if (response == 0U) {
+        if (has_cached_key) {
+            warning_message = "The server did not return a public key for " + recipient + ". Using the cached key instead.";
+            return true;
+        }
+
+        error_message = "No public key was found for " + recipient + ".";
+        return false;
+    }
+
+    if (response == 2U) {
+        if (has_cached_key) {
+            warning_message = recipient + " has not uploaded a key in this session yet. Using the cached key instead.";
+            return true;
+        }
+
+        error_message = recipient + " exists, but has not uploaded an encryption key yet. Ask them to sign in with the upgraded app once.";
+        return false;
+    }
+
+    uint32_t keyLength = 0;
+    boost::asio::read(socket, boost::asio::buffer(&keyLength, sizeof(keyLength)), error);
+    if (error) {
+        if (has_cached_key) {
+            warning_message = "Could not read the latest public key for " + recipient + ". Using the cached key instead.";
+            return true;
+        }
+
+        error_message = "Failed to read the contact public-key length: " + error.message();
+        return false;
+    }
+
+    std::vector<char> keyBuffer(keyLength);
+    boost::asio::read(socket, boost::asio::buffer(keyBuffer), error);
+    if (error) {
+        if (has_cached_key) {
+            warning_message = "Could not read the refreshed public key for " + recipient + ". Using the cached key instead.";
+            return true;
+        }
+
+        error_message = "Failed to read the contact public key: " + error.message();
+        return false;
+    }
+
+    std::string public_key_hex(keyBuffer.begin(), keyBuffer.end());
+    if (!CacheContactPublicKey(owner_user, recipient, public_key_hex, warning_message, error_message)) {
+        return false;
+    }
+
+    return true;
 }
 void receiveMessageContent(tcp::socket& receive_socket, const std::string& sender) {
     uint32_t message_length;
@@ -276,7 +698,12 @@ void receiveMessageContent(tcp::socket& receive_socket, const std::string& sende
     std::cout << "Received message: " << message << " from: " << sender << std::endl;
 
     string decrypted_message;
-    DecryptMessage(message, decrypted_message);
+    string decryptError;
+    if (!DecryptMessageForUser(userName, sender, message, decrypted_message, decryptError)) {
+        std::cerr << "Failed to decrypt incoming message: " << decryptError << std::endl;
+        SendSecurityNotification("Failed to decrypt a message from " + sender + ". " + decryptError);
+        return;
+    }
 
     std::string conversationFileName = "Conversations\\" + GetConversationFileName(sender, userName) + ".bin";
     std::ofstream conversationFile(conversationFileName, std::ios::app);
@@ -317,8 +744,61 @@ void receiveSender(tcp::socket& receive_socket) {
 
 }
 
+void receivePresenceUpdate(tcp::socket& receive_socket) {
+    boost::system::error_code error;
+    uint32_t user_name_length = 0;
+    boost::asio::read(receive_socket, boost::asio::buffer(&user_name_length, sizeof(user_name_length)), error);
+    if (error) {
+        std::cerr << "Error reading presence user length: " << error.message() << std::endl;
+        return;
+    }
+
+    std::vector<char> user_name_buffer(user_name_length);
+    boost::asio::read(receive_socket, boost::asio::buffer(user_name_buffer), error);
+    if (error) {
+        std::cerr << "Error reading presence user name: " << error.message() << std::endl;
+        return;
+    }
+
+    uint32_t online_state = 0;
+    boost::asio::read(receive_socket, boost::asio::buffer(&online_state, sizeof(online_state)), error);
+    if (error) {
+        std::cerr << "Error reading presence state: " << error.message() << std::endl;
+        return;
+    }
+
+    std::string user_name(user_name_buffer.begin(), user_name_buffer.end());
+    SendPresenceNotification(user_name, online_state == 1U);
+}
+
+void receiveTypingIndicator(tcp::socket& receive_socket) {
+    boost::system::error_code error;
+    uint32_t user_name_length = 0;
+    boost::asio::read(receive_socket, boost::asio::buffer(&user_name_length, sizeof(user_name_length)), error);
+    if (error) {
+        std::cerr << "Error reading typing user length: " << error.message() << std::endl;
+        return;
+    }
+
+    std::vector<char> user_name_buffer(user_name_length);
+    boost::asio::read(receive_socket, boost::asio::buffer(user_name_buffer), error);
+    if (error) {
+        std::cerr << "Error reading typing user name: " << error.message() << std::endl;
+        return;
+    }
+
+    uint32_t typing_state = 0;
+    boost::asio::read(receive_socket, boost::asio::buffer(&typing_state, sizeof(typing_state)), error);
+    if (error) {
+        std::cerr << "Error reading typing state: " << error.message() << std::endl;
+        return;
+    }
+
+    std::string user_name(user_name_buffer.begin(), user_name_buffer.end());
+    SendTypingNotification(user_name, typing_state == 1U);
+}
+
 bool Login(tcp::socket& send_socket) {
-    CreateFolder("Downloads");
     std::string Login = "login.bin";
     try {
         std::ifstream LoginFile(Login);
@@ -338,6 +818,15 @@ bool Login(tcp::socket& send_socket) {
         boost::asio::write(send_socket, boost::asio::buffer(password));
 
         userName = id;
+        if (!SwitchToUserProfileWorkspace(userName)) {
+            return false;
+        }
+        std::string publicKeyHex;
+        std::string keyError;
+        if (!EnsureUserKeys(userName, publicKeyHex, keyError)) {
+            std::cerr << "Failed to prepare encryption keys during login: " << keyError << std::endl;
+            return false;
+        }
         return true;
     }
     catch (std::exception& e) {
@@ -392,6 +881,58 @@ bool SendFileToServer(tcp::socket& send_socket, const std::string& recipient, st
         return false;
     }
     return false;
+}
+
+void SendTypingIndicatorRequest(tcp::socket& send_socket, const std::string& recipient, bool isTyping) {
+    if (recipient.empty() || recipient == ChatBotContactName) {
+        return;
+    }
+
+    boost::system::error_code error;
+    uint32_t message_type = MessageType::TYPING_INDICATOR;
+    boost::asio::write(send_socket, boost::asio::buffer(&message_type, sizeof(message_type)), error);
+    if (error) {
+        std::cerr << "Error sending typing request type: " << error.message() << std::endl;
+        return;
+    }
+
+    uint32_t recipient_length = static_cast<uint32_t>(recipient.size());
+    boost::asio::write(send_socket, boost::asio::buffer(&recipient_length, sizeof(recipient_length)), error);
+    if (error) {
+        std::cerr << "Error sending typing recipient length: " << error.message() << std::endl;
+        return;
+    }
+
+    boost::asio::write(send_socket, boost::asio::buffer(recipient), error);
+    if (error) {
+        std::cerr << "Error sending typing recipient: " << error.message() << std::endl;
+        return;
+    }
+
+    uint32_t typing_state = isTyping ? 1U : 0U;
+    boost::asio::write(send_socket, boost::asio::buffer(&typing_state, sizeof(typing_state)), error);
+    if (error) {
+        std::cerr << "Error sending typing state: " << error.message() << std::endl;
+    }
+}
+
+bool ClearChatBotMemory(tcp::socket& send_socket) {
+    boost::system::error_code error;
+    uint32_t message_type = MessageType::CLEAR_CHATBOT_MEMORY;
+    boost::asio::write(send_socket, boost::asio::buffer(&message_type, sizeof(message_type)), error);
+    if (error) {
+        std::cerr << "Error sending ChatBot clear request: " << error.message() << std::endl;
+        return false;
+    }
+
+    uint32_t response = 0;
+    boost::asio::read(send_socket, boost::asio::buffer(&response, sizeof(response)), error);
+    if (error) {
+        std::cerr << "Error reading ChatBot clear response: " << error.message() << std::endl;
+        return false;
+    }
+
+    return response == 1U;
 }
 
 void UpdateOfflineFiles(boost::asio::io_context& io_context, tcp::socket& control_socket) {
@@ -502,22 +1043,54 @@ void TextMessage(tcp::socket& socket, const std::string& filename) {
             return;
         }
 
-        uint32_t temp_message = MessageType::TEXT; // To notify the server that the action is sending message
-        boost::asio::write(socket, boost::asio::buffer(&temp_message, sizeof(temp_message)));
-
         std::string recipient, sender, message;
         std::getline(infile, recipient);
         std::getline(infile, sender);
         message.assign((std::istreambuf_iterator<char>(infile)), std::istreambuf_iterator<char>());
         infile.close();
+        std::string messageId;
+        TryGetMessageMetadataValue(message, "id", messageId);
+
+        const bool isChatBotMessage = IsChatBotRecipient(recipient);
+        std::string serverRecipient = recipient;
+        std::string keyWarning;
+        std::string encryption_error;
 
         string encrypted_message;
+        if (isChatBotMessage) {
+            serverRecipient = ChatBotContactName + "|" + LoadSelectedChatBotModel();
+            if (!WrapPlaintextMessage(message, encrypted_message, encryption_error)) {
+                std::cerr << "Unable to prepare the ChatBot message: " << encryption_error << std::endl;
+                SendSecurityNotification(encryption_error);
+                isReceivingAllowed = true;
+                return;
+            }
+        }
+        else {
+            if (!EnsureRecipientPublicKey(socket, sender, recipient, keyWarning, encryption_error)) {
+                std::cerr << "Unable to prepare the recipient public key: " << encryption_error << std::endl;
+                SendSecurityNotification(encryption_error);
+                isReceivingAllowed = true;
+                return;
+            }
 
-        EncryptMessage(message, encrypted_message);
+            if (!keyWarning.empty()) {
+                SendSecurityNotification(keyWarning);
+            }
 
-        std::cout << "send to: " << recipient << " message: " << encrypted_message << std::endl;
+            if (!EncryptMessageForConversation(sender, recipient, message, encrypted_message, encryption_error)) {
+                std::cerr << "Unable to encrypt the outgoing message: " << encryption_error << std::endl;
+                SendSecurityNotification(encryption_error);
+                isReceivingAllowed = true;
+                return;
+            }
+        }
 
-        std::string formattedMessage = recipient + "-" + sender + "\n" + encrypted_message;
+        std::cout << "send to: " << serverRecipient << " message: " << encrypted_message << std::endl;
+
+        std::string formattedMessage = serverRecipient + "-" + sender + "\n" + encrypted_message;
+        uint32_t temp_message = MessageType::TEXT; // To notify the server that the action is sending message
+        boost::asio::write(socket, boost::asio::buffer(&temp_message, sizeof(temp_message)));
 
         uint32_t filename_length = filename.size();
         /*boost::asio::write(socket, boost::asio::buffer(&filename_length, sizeof(filename_length)));
@@ -544,11 +1117,17 @@ void TextMessage(tcp::socket& socket, const std::string& filename) {
         cout << "{in TextMessage} response: " << response << endl;
         if (response == 1) {
             std::cout << "Message successfully sent to server." << std::endl;
+            if (!messageId.empty()) {
+                SendMessageStatusNotification(recipient, messageId, "delivered");
+            }
             /*delete(filename.c_str());
             delete(finishedFileName.c_str());*/
         }
         else {
             std::cerr << "Server failed to receive the message." << std::endl;
+            if (!messageId.empty()) {
+                SendMessageStatusNotification(recipient, messageId, "failed");
+            }
         }
     }
     catch (std::exception& e) {
@@ -626,7 +1205,12 @@ void UpdateOfflineMessages(tcp::socket& socket) {
             std::cout << "Received offline message from: " << sender << std::endl;
 
             string plain_message;
-            DecryptMessage(update_message, plain_message);
+            string decryptError;
+            if (!DecryptMessageForUser(userName, sender, update_message, plain_message, decryptError)) {
+                std::cerr << "Failed to decrypt an offline message: " << decryptError << std::endl;
+                SendSecurityNotification("Failed to decrypt an offline message from " + sender + ". " + decryptError);
+                continue;
+            }
             // Decrypt the message and save it to the conversation file:
             cout << "plain_message: " << plain_message << endl;
             std::ofstream conversation_file(conversationFileName, std::ios::app); // Open in append mode
@@ -642,14 +1226,12 @@ void UpdateOfflineMessages(tcp::socket& socket) {
     }
     if (sender_names.empty())
     {
-        SendNewMessageNotification("", ""); //dump message
         SendNewMessageNotification("System", notification);
     }
     else
     {
         sender_names = sender_names.substr(0, sender_names.size() - 2);  // Remove trailing ", "
         notification = "System [00:00-00/00/0000]: New messages from " + sender_names;
-        SendNewMessageNotification("", ""); //dump message
         SendNewMessageNotification("System", notification);
     }
     std::cout << "Finished updating offline messages." << std::endl;
@@ -675,6 +1257,12 @@ void asyncReceiveMessage(boost::asio::io_context& io_context, tcp::socket& recei
     // Process the signal based on its type
     if (signal == MessageType::RECEIVE_TEXT) {
         receiveSender(receive_socket);
+    }
+    else if (signal == MessageType::PRESENCE_UPDATE) {
+        receivePresenceUpdate(receive_socket);
+    }
+    else if (signal == MessageType::TYPING_INDICATOR) {
+        receiveTypingIndicator(receive_socket);
     }
     else if (signal == MessageType::UPDATE_Message) {
         UpdateOfflineMessages(receive_socket);
@@ -765,7 +1353,12 @@ void refreshConversations(tcp::socket& send_socket) {
 
                 // Decrypt the message
                 std::string decrypted_message;
-                DecryptMessage(message, decrypted_message);
+                std::string decryptError;
+                if (!DecryptMessageForUser(userName, sender, message, decrypted_message, decryptError)) {
+                    std::cerr << "Failed to decrypt a refreshed message: " << decryptError << std::endl;
+                    SendSecurityNotification("Failed to decrypt a stored message from " + sender + ". " + decryptError);
+                    continue;
+                }
 
                 // Save the decrypted message to the conversation file
                 std::string conversationFileName = conversationFolder + "/" + GetConversationFileName(sender, userName) + ".bin";
@@ -818,7 +1411,19 @@ void cleanup(tcp::socket& send_socket, tcp::socket& receive_socket, HANDLE hPipe
     if (hPipe != INVALID_HANDLE_VALUE) {
         DisconnectNamedPipe(hPipe);
         CloseHandle(hPipe);
+    }
+
+    if (hNotificationPipe != INVALID_HANDLE_VALUE) {
+        DisconnectNamedPipe(hNotificationPipe);
         CloseHandle(hNotificationPipe);
+        hNotificationPipe = INVALID_HANDLE_VALUE;
+    }
+
+    notificationPipeConnected = false;
+    notificationPipeAccepting = false;
+    {
+        std::lock_guard<std::mutex> lock(notificationPipeMutex);
+        pendingNotifications.clear();
     }
 
     std::cout << "Cleanup completed. Exiting program." << std::endl;
@@ -827,6 +1432,68 @@ void cleanup(tcp::socket& send_socket, tcp::socket& receive_socket, HANDLE hPipe
 std::wstring stringToWstring(const std::string& str) {
     return std::wstring(str.begin(), str.end());
 }
+
+void FlushPendingNotifications() {
+    std::lock_guard<std::mutex> lock(notificationPipeMutex);
+    if (hNotificationPipe == INVALID_HANDLE_VALUE || !notificationPipeConnected.load()) {
+        return;
+    }
+
+    while (!pendingNotifications.empty()) {
+        const std::string notification = pendingNotifications.front();
+        DWORD bytesWritten = 0;
+        if (!WriteFile(hNotificationPipe, notification.c_str(), static_cast<DWORD>(notification.size()), &bytesWritten, NULL)) {
+            DWORD error = GetLastError();
+            std::cerr << "Error flushing notification pipe backlog. Error: " << error << std::endl;
+            if (error == ERROR_BROKEN_PIPE || error == ERROR_NO_DATA) {
+                notificationPipeConnected = false;
+                DisconnectNamedPipe(hNotificationPipe);
+                StartNotificationPipeAcceptThread();
+            }
+            return;
+        }
+
+        pendingNotifications.pop_front();
+    }
+}
+
+void WaitForNotificationPipeConnection() {
+    if (hNotificationPipe == INVALID_HANDLE_VALUE) {
+        notificationPipeAccepting = false;
+        return;
+    }
+
+    BOOL isConnected = ConnectNamedPipe(hNotificationPipe, NULL) ? TRUE : (GetLastError() == ERROR_PIPE_CONNECTED);
+    if (isConnected) {
+        notificationPipeConnected = true;
+        std::cout << "Notification pipe client connected." << std::endl;
+        FlushPendingNotifications();
+    }
+    else {
+        DWORD error = GetLastError();
+        if (error != ERROR_OPERATION_ABORTED) {
+            std::cerr << "Failed to connect notification pipe. Error: " << error << std::endl;
+        }
+    }
+
+    notificationPipeAccepting = false;
+}
+
+void StartNotificationPipeAcceptThread() {
+    if (hNotificationPipe == INVALID_HANDLE_VALUE || notificationPipeConnected.load()) {
+        return;
+    }
+
+    bool expected = false;
+    if (!notificationPipeAccepting.compare_exchange_strong(expected, true)) {
+        return;
+    }
+
+    std::thread([]() {
+        WaitForNotificationPipeConnection();
+        }).detach();
+}
+
 // Creates and initializes the notification pipe with a unique name
 HANDLE InitializeNotificationPipe() {
     // Get the current time to generate a unique pipe name
@@ -857,8 +1524,11 @@ HANDLE InitializeNotificationPipe() {
 
     if (hPipe == INVALID_HANDLE_VALUE) {
         std::cerr << "Error creating notification pipe. Error: " << GetLastError() << std::endl;
-        return nullptr;
+        return INVALID_HANDLE_VALUE;
     }
+
+    notificationPipeConnected = false;
+    notificationPipeAccepting = false;
 
     return hPipe;
 }
@@ -892,8 +1562,11 @@ void commandListener(tcp::socket& send_socket, tcp::socket& receive_socket) {
 
     // Initialize the notification pipe
     hNotificationPipe = InitializeNotificationPipe();
-    if (hNotificationPipe == nullptr) {
+    if (hNotificationPipe == INVALID_HANDLE_VALUE) {
         std::cerr << "Failed to initialize notification pipe." << std::endl;
+    }
+    else {
+        StartNotificationPipeAcceptThread();
     }
 
     while (running) {
@@ -919,6 +1592,19 @@ void commandListener(tcp::socket& send_socket, tcp::socket& receive_socket) {
                         boost::asio::read(send_socket, boost::asio::buffer(&response, sizeof(response)));
                         cout << "(2) Login!" << endl;
                         if (response == 1) {
+                            std::string publishError;
+                            bool publishedKey = false;
+                            for (int attempt = 0; attempt < 3 && !publishedKey; ++attempt) {
+                                publishedKey = PublishCurrentUserPublicKey(send_socket, userName, publishError);
+                                if (!publishedKey && attempt < 2) {
+                                    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                                }
+                            }
+
+                            if (!publishedKey) {
+                                std::cerr << "Failed to publish the current user's public key: " << publishError << std::endl;
+                                SendSecurityNotification("Failed to sync your encryption key with the server. " + publishError);
+                            }
                             LoginAuthFile << "success" << std::endl;
                         }
                         else if (response == 0) {
@@ -967,7 +1653,7 @@ void commandListener(tcp::socket& send_socket, tcp::socket& receive_socket) {
                 else if (command == "SHUTDOWN") {
                     std::cout << "Exiting..." << std::endl;
                     running = false;
-                    //break;
+                    break;
                 }
                 else if (command == "REFRESH")
                 {
@@ -1002,13 +1688,27 @@ void commandListener(tcp::socket& send_socket, tcp::socket& receive_socket) {
                     // Call the changePassword function
                     changePassword(send_socket, currentPassword, newPassword);
                 }
-                else if (command == "ADD_FRIEND")
-                {
-                    addFriend(send_socket);
-                }
-                else {
-                    std::cerr << "Unknown command: " << command << std::endl;
-                }
+        else if (command == "ADD_FRIEND")
+        {
+            addFriend(send_socket);
+        }
+        else if (command.rfind("TYPING:", 0) == 0) {
+            std::string payload = command.substr(std::string("TYPING:").size());
+            size_t separator = payload.rfind(':');
+            if (separator != std::string::npos) {
+                std::string recipient = payload.substr(0, separator);
+                std::string state = payload.substr(separator + 1);
+                SendTypingIndicatorRequest(send_socket, recipient, state == "start");
+            }
+        }
+        else if (command == "CLEAR_CHATBOT_MEMORY") {
+            if (!ClearChatBotMemory(send_socket)) {
+                SendSecurityNotification("Failed to clear ChatBot memory on the server.");
+            }
+        }
+        else {
+            std::cerr << "Unknown command: " << command << std::endl;
+        }
             }
         }
 

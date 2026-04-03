@@ -8,6 +8,7 @@ namespace MessagingApp
         [STAThread]
         private static void Main()
         {
+            AppPaths.Initialize();
             Application.EnableVisualStyles();
             Application.Run(new MainForm());
         }

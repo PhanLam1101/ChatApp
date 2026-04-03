@@ -13,6 +13,13 @@ namespace MessagingApp
 {
     public partial class MessagingForm : Form
     {
+        private sealed class ChatBotModelOption
+        {
+            public string DisplayName { get; init; } = string.Empty;
+            public string ModelName { get; init; } = string.Empty;
+        }
+
+        private const string ChatBotContactName = "ChatBot";
         private Panel chatPanelBorder = null!;
         private Panel contactPanelBorder = null!;
         private Panel sendMessageButtonBorder = null!;
@@ -53,18 +60,21 @@ namespace MessagingApp
 
         private string? currentPerson;
         private readonly string currentUserName;
-        private readonly string conversationFolder = "Conversations";
-        private readonly string settingFolder = "Settings";
-        private readonly string iconFolder = "Icons";
-        private readonly string templatesFolder = "Templates";
+        private readonly string conversationFolder = AppPaths.ConversationsDirectory;
+        private readonly string settingFolder = AppPaths.SettingsDirectory;
+        private readonly string iconFolder = AppPaths.IconsDirectory;
+        private readonly string templatesFolder = AppPaths.TemplatesDirectory;
 
         private Panel unaddedContactsPanel = null!;
         private ListBox unaddedContactsList = null!;
         private Button addSelectedContactButton = null!;
         private Label unaddedContactsLabel = null!;
-        private readonly string unaddedContactsFile = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "UnaddedContact.txt");
+        private readonly string unaddedContactsFile = AppPaths.UnaddedContactsFile;
 
         private List<string> people = new List<string>();
+        private readonly Dictionary<string, bool> contactOnlineStates = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, int> unreadCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, string> lastMessagePreviews = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
         private CheckBox enableSoundCheckBox = null!;
         private CheckBox enablePopupCheckBox = null!;
@@ -72,6 +82,7 @@ namespace MessagingApp
 
         private ToolStripMenuItem functionsMenu = null!;
         private ToolStripMenuItem templatesMenu = null!;
+        private ToolStripMenuItem chatBotModelMenu = null!;
 
         private readonly Random random = new Random();
 
@@ -84,7 +95,12 @@ namespace MessagingApp
         private FileSystemWatcher? fileWatcher;
         private FileSystemWatcher? friendListWatcher;
         private long lastFileSize;
+        private string pendingConversationChunk = string.Empty;
+        private bool skipNextConversationWatcherChange;
         private FileSystemWatcher? unaddedContactsWatcher;
+        private bool suppressPeopleSelectionChange;
+        private List<ChatBotModelOption> chatBotModels = new List<ChatBotModelOption>();
+        private string selectedChatBotModel = "gemma3:1b";
 
         private Panel messageDetailsPanel = null!;
         private Panel chatSearchPanel = null!;
@@ -119,6 +135,7 @@ namespace MessagingApp
             UpdateStyles();
 
             LoadFontPreferences();
+            LoadChatBotModelSettings();
             InitializeComponent();
             InitializePanels();
             InitializeUIElements();
@@ -127,7 +144,7 @@ namespace MessagingApp
             InitializeChatSearchPanel();
             LoadNotificationPreferences();
 
-            PipeConnectionManager.OnNewMessageNotification += OnNewMessageReceived;
+            PipeConnectionManager.OnNotificationReceived += OnNotificationReceived;
             Load += MessageForm_LoadTheme;
             FormClosing += MessageForm_FormClosing;
 

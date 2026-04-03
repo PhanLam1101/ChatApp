@@ -208,7 +208,7 @@ namespace MessagingApp
 
         private static string GetThemeSettingsPath()
         {
-            string settingsDirectory = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Settings");
+            string settingsDirectory = AppPaths.SettingsDirectory;
             Directory.CreateDirectory(settingsDirectory);
             return Path.Combine(settingsDirectory, "ThemeSettings.txt");
         }

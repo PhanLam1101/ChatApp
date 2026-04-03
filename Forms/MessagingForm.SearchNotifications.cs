@@ -6,6 +6,7 @@ using System.IO;
 using System.IO.Pipes;
 using System.Linq;
 using System.Media;
+using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Windows.Forms;
@@ -145,8 +146,13 @@ namespace MessagingApp
 		{
 			return;
 		}
+		if (IsChatBotContact(selectedContact))
+		{
+			MessageBox.Show("ChatBot is built into the app and cannot be removed.", "ChatBot", MessageBoxButtons.OK, MessageBoxIcon.Information);
+			return;
+		}
 
-		string friendListFilePath = "Friend_List.txt";
+		string friendListFilePath = AppPaths.FriendListFile;
 		try
 		{
 			List<string> currentContacts = File.ReadAllLines(friendListFilePath).ToList();
@@ -188,7 +194,8 @@ namespace MessagingApp
 	{
 		if (!string.IsNullOrEmpty(fullMessage))
 		{
-			detailedMessageBox.Text = fullMessage;
+			TryExtractMetadata(fullMessage, out _, out string cleanMessage);
+			detailedMessageBox.Text = cleanMessage;
 			messageDetailsPanel.Visible = true;
 			messageDetailsPanel.BringToFront();
 		}
@@ -215,7 +222,7 @@ namespace MessagingApp
 			MessageBox.Show("Please enter a keyword to search!");
 			return;
 		}
-		string conversationFileName = "Conversations\\" + GetConversationFileName(currentPerson, currentUserName);
+		string conversationFileName = Path.Combine(conversationFolder, GetConversationFileName(currentPerson, currentUserName));
 		searchResults = SearchMessagesInFile(conversationFileName, keyword);
 		if (searchResults.Count > 0)
 		{
@@ -244,7 +251,13 @@ namespace MessagingApp
 			string[] array = File.ReadAllText(conversationFileName).Split(new string[1] { delimiter }, StringSplitOptions.RemoveEmptyEntries);
 			foreach (string message in array)
 			{
-				if (message.IndexOf(keyword, StringComparison.OrdinalIgnoreCase) >= 0)
+				ParsedChatEntry entry = ParseChatEntry(message.Trim());
+				if (entry.IsControl)
+				{
+					continue;
+				}
+
+				if (entry.Body.IndexOf(keyword, StringComparison.OrdinalIgnoreCase) >= 0)
 				{
 					string cleanMessage = message.Trim();
 					matchingMessages.Add(cleanMessage);
@@ -258,23 +271,162 @@ namespace MessagingApp
 		return matchingMessages;
 	}
 
-	private void OnNewMessageReceived(string notification)
+	private void OnNotificationReceived(string notification)
 	{
-		if (!string.IsNullOrEmpty(notification))
+		if (string.IsNullOrWhiteSpace(notification))
 		{
-			int firstColonIndex = notification.IndexOf(':');
-			int secondColonIndex = notification.IndexOf(':', firstColonIndex + 1);
-			int thirdColonIndex = notification.IndexOf(':', secondColonIndex + 1);
-			if (firstColonIndex != -1 && secondColonIndex != -1 && thirdColonIndex != -1)
+			return;
+		}
+
+		if (InvokeRequired)
+		{
+			BeginInvoke((MethodInvoker)delegate
 			{
-				string sender = notification.Substring(0, firstColonIndex).Trim();
-				string messageBody = notification.Substring(thirdColonIndex + 1).Trim();
-				ShowNotification(sender, messageBody);
-			}
-			else
+				OnNotificationReceived(notification);
+			});
+			return;
+		}
+
+		if (notification.StartsWith("PRESENCE:", StringComparison.Ordinal))
+		{
+			string payload = notification.Substring("PRESENCE:".Length);
+			int separatorIndex = payload.LastIndexOf(':');
+			if (separatorIndex <= 0)
 			{
-				ShowNotification("New message", "Unknown content");
+				return;
 			}
+
+			string userName = payload.Substring(0, separatorIndex).Trim();
+			string state = payload.Substring(separatorIndex + 1).Trim();
+			if (string.IsNullOrWhiteSpace(userName))
+			{
+				return;
+			}
+
+			EnsureContactState(userName);
+			contactOnlineStates[userName] = string.Equals(state, "online", StringComparison.OrdinalIgnoreCase);
+			UpdatePeopleList();
+			UpdateConversationHeader(currentPerson);
+			return;
+		}
+
+		if (notification.StartsWith("SECURITY:", StringComparison.Ordinal))
+		{
+			string securityMessage = notification.Substring("SECURITY:".Length).Trim();
+			if (!string.IsNullOrWhiteSpace(securityMessage))
+			{
+				ShowNotification("Security", securityMessage);
+			}
+			return;
+		}
+
+		if (notification.StartsWith("TYPING:", StringComparison.Ordinal))
+		{
+			string payload = notification.Substring("TYPING:".Length);
+			int separatorIndex = payload.LastIndexOf(':');
+			if (separatorIndex <= 0)
+			{
+				return;
+			}
+
+			string typingSender = payload.Substring(0, separatorIndex).Trim();
+			string state = payload.Substring(separatorIndex + 1).Trim();
+			if (string.IsNullOrWhiteSpace(typingSender))
+			{
+				return;
+			}
+
+			RegisterTypingIndicator(typingSender, string.Equals(state, "start", StringComparison.OrdinalIgnoreCase));
+			return;
+		}
+
+		if (notification.StartsWith("MESSAGE_STATUS:", StringComparison.Ordinal))
+		{
+			string payload = notification.Substring("MESSAGE_STATUS:".Length);
+			string[] parts = payload.Split(':');
+			if (parts.Length < 3)
+			{
+				return;
+			}
+
+			string messageId = parts[1].Trim();
+			string status = parts[2].Trim().ToLowerInvariant();
+			if (!string.IsNullOrWhiteSpace(messageId))
+			{
+				outgoingMessageStatuses[messageId] = status;
+				if (!string.IsNullOrWhiteSpace(currentPerson))
+				{
+					RenderActiveConversation();
+				}
+			}
+			return;
+		}
+
+		bool isEncodedNewMessage = notification.StartsWith("NEW_MESSAGE_HEX:", StringComparison.Ordinal);
+		if (!isEncodedNewMessage && !notification.StartsWith("NEW_MESSAGE:", StringComparison.Ordinal))
+		{
+			return;
+		}
+
+		string messagePayload = notification.Substring(isEncodedNewMessage ? "NEW_MESSAGE_HEX:".Length : "NEW_MESSAGE:".Length);
+		int senderSeparatorIndex = messagePayload.IndexOf(':');
+		if (senderSeparatorIndex <= 0)
+		{
+			ShowNotification("New message", "Unknown content");
+			return;
+		}
+
+		string sender = messagePayload.Substring(0, senderSeparatorIndex).Trim();
+		string rawMessage = messagePayload.Substring(senderSeparatorIndex + 1).Trim();
+		if (isEncodedNewMessage)
+		{
+			if (!TryDecodeHexNotificationValue(sender, out string decodedSender) ||
+				!TryDecodeHexNotificationValue(rawMessage, out string decodedMessage))
+			{
+				ShowNotification("New message", "Could not decode the notification payload.");
+				return;
+			}
+
+			sender = decodedSender;
+			rawMessage = decodedMessage;
+		}
+
+		ParsedChatEntry entry = ParseChatEntry(rawMessage);
+		RefreshConversationMetadataForContact(sender);
+		if (entry.IsControl)
+		{
+			if (string.Equals(currentPerson, sender, StringComparison.OrdinalIgnoreCase))
+			{
+				RenderActiveConversation();
+			}
+			UpdatePeopleList();
+			return;
+		}
+
+		string messageBody = entry.Body;
+		IncrementUnreadCount(sender);
+		UpdatePeopleList();
+		UpdateConversationHeader(currentPerson);
+		ShowNotification(sender, messageBody);
+	}
+
+	private static bool TryDecodeHexNotificationValue(string encodedValue, out string decodedValue)
+	{
+		decodedValue = string.Empty;
+		if (string.IsNullOrWhiteSpace(encodedValue) || (encodedValue.Length % 2) != 0)
+		{
+			return false;
+		}
+
+		try
+		{
+			byte[] bytes = Convert.FromHexString(encodedValue);
+			decodedValue = Encoding.UTF8.GetString(bytes);
+			return true;
+		}
+		catch (FormatException)
+		{
+			return false;
 		}
 	}
 
@@ -365,7 +517,7 @@ namespace MessagingApp
 	{
 		try
 		{
-			new SoundPlayer("SoundEffects\\\\Notification-01.wav").Play();
+			new SoundPlayer(AppPaths.NotificationSoundFile).Play();
 		}
 		catch (Exception ex)
 		{

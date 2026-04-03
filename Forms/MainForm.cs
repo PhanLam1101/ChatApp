@@ -10,7 +10,7 @@ namespace MessagingApp
     public partial class MainForm : Form
     {
         private string currentUserName = "";
-        private string iconFolder = "Icons";
+        private readonly string iconFolder = AppPaths.IconsDirectory;
 
         public MainForm()
         {
@@ -60,7 +60,7 @@ namespace MessagingApp
             this.BackColor = themePalette.BackgroundColor;
             this.BackgroundImage = null;
             this.MaximizeBox = false;
-            string iconPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "app-icon1.ico");
+            string iconPath = AppPaths.AppIconFile;
             if (File.Exists(iconPath))
             {
                 this.Icon = new Icon(iconPath);
@@ -68,7 +68,7 @@ namespace MessagingApp
 
             Label headerLabel = new Label()
             {
-                Text = "Welcome to ChattingApp",
+                Text = "Welcome to ChatApp",
                 Font = new Font("Segoe UI", 14, FontStyle.Bold),
                 ForeColor = textColor,
                 TextAlign = ContentAlignment.MiddleCenter,
@@ -245,7 +245,7 @@ namespace MessagingApp
             {
                 Location = new Point(270, 140),
                 Size = new Size(40, 40),
-                BackgroundImage = Image.FromFile(iconFolder + "//hint.bmp"),
+                BackgroundImage = LoadImage(Path.Combine(iconFolder, "hint.bmp")),
                 BackgroundImageLayout = ImageLayout.Stretch,
                 BackColor = accentSoftColor,
                 FlatStyle = FlatStyle.Flat
@@ -285,12 +285,7 @@ namespace MessagingApp
                 ForeColor = textColor
             };
             this.Controls.Add(IPLabel);
-            if (!File.Exists("IP_Server.txt"))
-            {
-                File.WriteAllText("IP_Server.txt", "unknown");
-                File.WriteAllText("MessageProgram\\x64\\Release\\IP_Server.txt", "unknown");
-            }
-            string IPServer = File.ReadAllText("IP_Server.txt");
+            string IPServer = File.ReadAllText(AppPaths.ServerIpFile).Trim();
             TextBox IPInput = new TextBox()
             {
                 Location = new Point(150, 500),
@@ -319,7 +314,7 @@ namespace MessagingApp
 
             Label footerLabel = new Label()
             {
-                Text = "Made by Group 1 \n Version: Prototype",
+                Text = "Version: Prototype",
                 Font = new Font("Segoe UI", 10, FontStyle.Italic),
                 ForeColor = mutedTextColor,
                 TextAlign = ContentAlignment.MiddleCenter,
@@ -332,17 +327,13 @@ namespace MessagingApp
 
         private void IPChange(string newIP)
         {
-            if (newIP == null)
+            if (string.IsNullOrWhiteSpace(newIP))
             {
                 MessageBox.Show("Enter IP of the server", "Warning", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
-            string IPFilePath = "IP_Server.txt";
-            string IPFilePath1 = "MessageProgram\\x64\\Release\\IP_Server.txt";
-            string IPFilePath2 = "MessageProgram\\x64\\Release\\IP_Server.txt";
-            File.WriteAllText(IPFilePath, newIP);
-            File.WriteAllText(IPFilePath1, newIP);
-            File.WriteAllText(IPFilePath2, newIP);
+
+            File.WriteAllText(AppPaths.ServerIpFile, newIP.Trim());
 
             MessageBox.Show("IP Address has been changed!");
         }
@@ -371,54 +362,52 @@ namespace MessagingApp
             }
             else
             {
-                string registerFilePath = "register.bin";
-                string resultFilePath = "register_result.bin";
-                string programFile = "program.txt";
-                string programPath;
+                string registerFilePath = AppPaths.RegisterRequestFile;
+                string resultFilePath = AppPaths.RegisterResultFile;
                 File.WriteAllText(registerFilePath, $"{id}\n{password}");
                 Thread.Sleep(500);
 
-                if (!File.Exists(programFile))
+                Process? process = StartBridgeProcess();
+                if (process == null)
                 {
-                    File.WriteAllText(programFile, "MessageProgram\\x64\\Release\\MessageProgram.exe");
-                }
-                programPath = File.ReadAllText(programFile);
-                Process process = new Process();
-                process.StartInfo.FileName = programPath;
-                process.StartInfo.Arguments = registerFilePath;
-                process.Start();
-                Thread.Sleep(1000);
-
-                if (PipeConnectionManager.InitializePipe())
-                {
-                    PipeConnectionManager.PipeWriter.WriteLine("REGISTER");
-                    PipeConnectionManager.PipeWriter.Flush();
-                }
-                else
-                {
-                    MessageBox.Show("Unable to establish a connection with the C++ program.");
-                    process.Kill();
+                    DeleteFileIfExists(registerFilePath);
                     return;
                 }
 
-                Thread.Sleep(500);
+                if (TrySendPipeCommand("REGISTER", process))
+                {
+                    Thread.Sleep(500);
+                }
+                else
+                {
+                    DeleteFileIfExists(registerFilePath);
+                    return;
+                }
+
                 if (File.Exists(resultFilePath))
                 {
-                    string loginResult = File.ReadAllText(resultFilePath).Trim();
+                    if (!TryReadResultFile(resultFilePath, out string loginResult))
+                    {
+                        MessageBox.Show("Could not read the registration result from the C++ helper. Please try again.");
+                        DeleteFileIfExists(registerFilePath);
+                        ShutdownBridgeProcess(process);
+                        return;
+                    }
+
                     if (loginResult == "success")
                     {
                         MessageBox.Show("Register successful! \nPlease use this ID and password to sign in");
                         currentUserName = id;
-                        File.Delete(registerFilePath);
-                        File.Delete(resultFilePath);
-                        PipeConnectionManager.ClosePipe();
+                        DeleteFileIfExists(registerFilePath);
+                        DeleteFileIfExists(resultFilePath);
+                        ShutdownBridgeProcess(process);
                     }
                     else if (loginResult == "fail")
                     {
                         MessageBox.Show("Register failed. Please try again. \nSomeone used this ID before!");
-                        File.Delete(resultFilePath);
-                        File.Delete(registerFilePath);
-                        PipeConnectionManager.ClosePipe();
+                        DeleteFileIfExists(resultFilePath);
+                        DeleteFileIfExists(registerFilePath);
+                        ShutdownBridgeProcess(process);
                     }
                 }
             }
@@ -436,61 +425,209 @@ namespace MessagingApp
                 MessageBox.Show("Please enter your password", "Remind", MessageBoxButtons.OK, MessageBoxIcon.Exclamation);
                 return;
             }
-            string loginFilePath = "login.bin";
-            string resultFilePath = "login_result.bin";
-            string programFile = "program.txt";
-            string programPath;
+            string loginFilePath = AppPaths.LoginRequestFile;
+            string resultFilePath = AppPaths.LoginResultFile;
+            AppPaths.PrepareUserProfile(id);
             File.WriteAllText(loginFilePath, $"{id}\n{password}");
             Thread.Sleep(500);
 
-            if (!File.Exists(programFile))
+            Process? process = StartBridgeProcess();
+            if (process == null)
             {
-                File.WriteAllText(programFile, "MessageProgram\\x64\\Release\\MessageProgram.exe");
-            }
-            programPath = File.ReadAllText(programFile);
-            Process process = new Process();
-            process.StartInfo.FileName = programPath;
-            process.StartInfo.Arguments = loginFilePath;
-            process.Start();
-            Thread.Sleep(1000);
-
-            if (PipeConnectionManager.InitializePipe())
-            {
-                PipeConnectionManager.PipeWriter.WriteLine("LOGIN");
-                PipeConnectionManager.PipeWriter.Flush();
-            }
-            else
-            {
-                MessageBox.Show("Unable to establish a connection with the C++ program.");
-                process.Kill();
+                DeleteFileIfExists(loginFilePath);
                 return;
             }
 
-            Thread.Sleep(500);
+            if (TrySendPipeCommand("LOGIN", process))
+            {
+                Thread.Sleep(500);
+            }
+            else
+            {
+                DeleteFileIfExists(loginFilePath);
+                return;
+            }
+
             if (File.Exists(resultFilePath))
             {
-                string loginResult = File.ReadAllText(resultFilePath).Trim();
+                if (!TryReadResultFile(resultFilePath, out string loginResult))
+                {
+                    MessageBox.Show("Could not read the login result from the C++ helper. Please try again.");
+                    DeleteFileIfExists(loginFilePath);
+                    ShutdownBridgeProcess(process);
+                    return;
+                }
+
                 if (loginResult == "success")
                 {
                     MessageBox.Show("Login successful!");
                     currentUserName = id;
-                    OpenMessagingForm();
-                    File.Delete(loginFilePath);
-                    File.Delete(resultFilePath);
+                    DeleteFileIfExists(loginFilePath);
+                    DeleteFileIfExists(resultFilePath);
                     if (!PipeConnectionManager.InitializeNotificationPipe())
                     {
                         MessageBox.Show("Unable to establish a connection with the C++ program.");
-                        process.Kill();
+                        StopProcess(process);
                         return;
                     }
+
+                    AppPaths.ActivateUserProfile(currentUserName);
+                    OpenMessagingForm();
                 }
                 else if (loginResult == "fail")
                 {
                     MessageBox.Show("Login failed. Please try again.");
-                    File.Delete(resultFilePath);
-                    File.Delete(loginFilePath);
-                    PipeConnectionManager.ClosePipe();
+                    DeleteFileIfExists(resultFilePath);
+                    DeleteFileIfExists(loginFilePath);
+                    ShutdownBridgeProcess(process);
                 }
+            }
+        }
+
+        private static bool TryReadResultFile(string path, out string result)
+        {
+            const int maxAttempts = 20;
+            result = string.Empty;
+
+            for (int attempt = 0; attempt < maxAttempts; attempt++)
+            {
+                if (!File.Exists(path))
+                {
+                    Thread.Sleep(150);
+                    continue;
+                }
+
+                try
+                {
+                    result = File.ReadAllText(path).Trim();
+                    return true;
+                }
+                catch (IOException)
+                {
+                    Thread.Sleep(150);
+                }
+                catch (UnauthorizedAccessException)
+                {
+                    Thread.Sleep(150);
+                }
+            }
+
+            return false;
+        }
+
+        private Image? LoadImage(string imagePath)
+        {
+            return File.Exists(imagePath) ? Image.FromFile(imagePath) : null;
+        }
+
+        private Process? StartBridgeProcess()
+        {
+            string programPath = AppPaths.ResolveBridgeExecutablePath();
+            if (string.IsNullOrWhiteSpace(programPath))
+            {
+                MessageBox.Show(
+                    "MessageProgram.exe could not be found. Keep the MessageProgram folder next to UserInterface.exe.",
+                    "Missing Helper Program",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+                return null;
+            }
+
+            try
+            {
+                DeleteFileIfExists(AppPaths.PipeConnectionFile);
+                DeleteFileIfExists(AppPaths.NotificationPipeFile);
+                AppPaths.SyncSessionServerIp();
+
+                Process process = new Process();
+                process.StartInfo.FileName = programPath;
+                process.StartInfo.WorkingDirectory = AppPaths.SessionRoot;
+                process.StartInfo.UseShellExecute = false;
+                process.StartInfo.CreateNoWindow = true;
+                process.StartInfo.WindowStyle = ProcessWindowStyle.Hidden;
+                process.StartInfo.Environment["MESSAGINGAPP_PROFILES_ROOT"] = AppPaths.ProfilesRoot;
+                process.Start();
+                Thread.Sleep(1000);
+                return process;
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Unable to start the C++ helper program: {ex.Message}", "Startup Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return null;
+            }
+        }
+
+        private bool TrySendPipeCommand(string command, Process process)
+        {
+            if (!PipeConnectionManager.InitializePipe())
+            {
+                MessageBox.Show("Unable to establish a connection with the C++ program.");
+                StopProcess(process);
+                return false;
+            }
+
+            StreamWriter? pipeWriter = PipeConnectionManager.PipeWriter;
+            if (pipeWriter == null)
+            {
+                MessageBox.Show("The connection to the C++ program was created, but no pipe writer is available.");
+                StopProcess(process);
+                return false;
+            }
+
+            pipeWriter.WriteLine(command);
+            pipeWriter.Flush();
+            return true;
+        }
+
+        private static void StopProcess(Process process)
+        {
+            try
+            {
+                if (!process.HasExited)
+                {
+                    process.Kill();
+                    process.WaitForExit(1000);
+                }
+            }
+            catch (InvalidOperationException)
+            {
+            }
+        }
+
+        private static void ShutdownBridgeProcess(Process? process)
+        {
+            PipeConnectionManager.ClosePipe();
+
+            if (process == null)
+            {
+                return;
+            }
+
+            try
+            {
+                if (process.HasExited)
+                {
+                    return;
+                }
+
+                if (process.WaitForExit(1500))
+                {
+                    return;
+                }
+            }
+            catch (InvalidOperationException)
+            {
+                return;
+            }
+
+            StopProcess(process);
+        }
+
+        private static void DeleteFileIfExists(string path)
+        {
+            if (File.Exists(path))
+            {
+                File.Delete(path);
             }
         }
 

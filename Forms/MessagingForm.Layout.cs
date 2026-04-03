@@ -10,10 +10,10 @@ namespace MessagingApp
     public partial class MessagingForm : Form
     {
         private const int SidebarWidth = 336;
-        private const int SidebarActionsHeight = 122;
+        private const int SidebarActionsHeight = 152;
         private const int UnaddedContactsHeight = 184;
-        private const int ChatHeaderHeight = 92;
-        private const int ComposerHeight = 168;
+        private const int ChatHeaderHeight = 122;
+        private const int ComposerHeight = 204;
 
         private TableLayoutPanel sidebarLayout = null!;
         private TableLayoutPanel chatLayout = null!;
@@ -237,6 +237,7 @@ namespace MessagingApp
             };
             peopleList.DrawItem += DrawPeopleListItem;
             peopleList.SelectedIndexChanged += PersonSelected;
+            peopleList.MouseUp += PeopleListMouseUp;
             toolTip.SetToolTip(peopleList, "Open a conversation.");
 
             addContactLabel = new Label
@@ -289,20 +290,29 @@ namespace MessagingApp
 
             removeContactButton = new Button
             {
-                Dock = DockStyle.Bottom,
-                Height = 40,
+                Dock = DockStyle.Fill,
                 Text = "Remove Selected",
                 Font = new Font("Segoe UI Semibold", 10f, FontStyle.Bold),
-                Margin = new Padding(0, 12, 0, 0)
+                Margin = new Padding(0)
             };
             removeContactButton.Click += (_, _) => RemoveSelectedContact();
             ConfigureActionButton(removeContactButton, currentDangerColor, Color.White);
             toolTip.SetToolTip(removeContactButton, "Remove the selected contact.");
 
+            Panel removeContactContainer = new Panel
+            {
+                Dock = DockStyle.Bottom,
+                Height = 56,
+                BackColor = currentSidebarColor,
+                Padding = new Padding(0, 14, 0, 0),
+                Margin = new Padding(0)
+            };
+            removeContactContainer.Controls.Add(removeContactButton);
+
             addContactInputCard.Controls.Add(addContactInput);
             addContactRow.Controls.Add(addContactInputCard);
             addContactRow.Controls.Add(addContactButton);
-            contactActionsPanel.Controls.Add(removeContactButton);
+            contactActionsPanel.Controls.Add(removeContactContainer);
             contactActionsPanel.Controls.Add(addContactRow);
             contactActionsPanel.Controls.Add(addContactLabel);
 
@@ -334,6 +344,7 @@ namespace MessagingApp
             };
             chatHeaderInfoPanel.Controls.Add(activeChatSubtitleLabel);
             chatHeaderInfoPanel.Controls.Add(activeChatTitleLabel);
+            InitializePinnedMessagePanel(chatHeaderInfoPanel);
 
             FlowLayoutPanel headerActionsPanel = new FlowLayoutPanel
             {
@@ -387,6 +398,7 @@ namespace MessagingApp
                 Margin = new Padding(0)
             };
             toolTip.SetToolTip(chatbox, "Conversation history.");
+            chatbox.MouseUp += ChatboxMouseUp;
 
             TableLayoutPanel composerLayout = new TableLayoutPanel
             {
@@ -427,7 +439,11 @@ namespace MessagingApp
                 BackColor = currentComposerColor,
                 ForeColor = currentTextColor
             };
-            messageInput.TextChanged += (_, _) => UpdateTextInfo();
+            messageInput.TextChanged += (_, _) =>
+            {
+                UpdateTextInfo();
+                HandleMessageInputChanged();
+            };
             messageInput.KeyUp += (_, _) => UpdateTextInfo();
             messageInput.MouseClick += (_, _) => UpdateTextInfo();
             messageInput.KeyDown += HandleMessageInputKeyDown;
@@ -446,6 +462,7 @@ namespace MessagingApp
 
             messageEditorPanel.Controls.Add(messageInput);
             messageEditorPanel.Controls.Add(textInfoLabel);
+            InitializeReplyPreviewPanel(messageEditorPanel);
             sendMessageButtonBorder.Controls.Add(sendMessageButton);
             composerLayout.Controls.Add(messageEditorPanel, 0, 0);
             composerLayout.Controls.Add(sendMessageButtonBorder, 1, 0);
@@ -463,6 +480,7 @@ namespace MessagingApp
             chatLayout.Controls.Add(messageInputCard, 0, 2);
 
             InitializeNotificationPreferencesPanel();
+            InitializeAdvancedChatFeatures();
             UpdateTextInfo();
             UpdateConversationHeader(null);
         }
@@ -668,7 +686,7 @@ namespace MessagingApp
             ClientSize = new Size(1280, 800);
             MinimumSize = new Size(1120, 760);
             BackColor = currentBackgroundColor;
-            string iconPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "app-icon1.ico");
+            string iconPath = AppPaths.AppIconFile;
             if (File.Exists(iconPath))
             {
                 Icon = new Icon(iconPath);
@@ -693,8 +711,15 @@ namespace MessagingApp
             openDownloadsMenuItem.ShortcutKeys = Keys.Control | Keys.D;
             ToolStripMenuItem exportConversationMenuItem = CreateMenuItem("Export Conversation", "export_file.bmp", (_, _) => ExportConversation());
             exportConversationMenuItem.ShortcutKeys = Keys.Control | Keys.P;
+            ToolStripMenuItem pinCurrentChatMenuItem = CreateMenuItem("Pin or Unpin Current Chat", "choose_template.bmp", (_, _) => TogglePinnedCurrentChat());
+            ToolStripMenuItem clearCurrentChatMenuItem = CreateMenuItem("Clear Current Chat Locally", "remove_contact.bmp", (_, _) => ClearCurrentChatFromMenu());
+            ToolStripMenuItem clearChatBotMemoryMenuItem = CreateMenuItem("Clear ChatBot Memory", "remove_contact.bmp", (_, _) => ResetCurrentChatBotMemoryFromMenu());
             fileMenu.DropDownItems.Add(openDownloadsMenuItem);
             fileMenu.DropDownItems.Add(exportConversationMenuItem);
+            fileMenu.DropDownItems.Add(new ToolStripSeparator());
+            fileMenu.DropDownItems.Add(pinCurrentChatMenuItem);
+            fileMenu.DropDownItems.Add(clearCurrentChatMenuItem);
+            fileMenu.DropDownItems.Add(clearChatBotMemoryMenuItem);
 
             functionsMenu = CreateMenuItem("Functions", "function.bmp");
             ToolStripMenuItem chatSearchMenu = CreateMenuItem("Chat Search", "search_chat.bmp", (_, _) => ToggleChatSearchPanel());
@@ -763,11 +788,14 @@ namespace MessagingApp
             }
 
             ToolStripMenuItem notificationPreferencesMenuItem = CreateMenuItem("Notification Preferences", "notification_setting.bmp", (_, _) => ToggleNotificationPreferencesPanel());
+            chatBotModelMenu = CreateMenuItem("ChatBot Model", "theme_colorful.bmp");
+            PopulateChatBotModelMenu();
             ToolStripMenuItem aboutMenu = CreateMenuItem("About ChatApp", "information.bmp", (_, _) => ShowAppInfo());
 
             settingsMenu.DropDownItems.Add(fontSizeMenu);
             settingsMenu.DropDownItems.Add(themeMenu);
             settingsMenu.DropDownItems.Add(fontSettingsMenu);
+            settingsMenu.DropDownItems.Add(chatBotModelMenu);
             settingsMenu.DropDownItems.Add(new ToolStripSeparator());
             settingsMenu.DropDownItems.Add(notificationPreferencesMenuItem);
             settingsMenu.DropDownItems.Add(aboutMenu);
@@ -832,6 +860,10 @@ namespace MessagingApp
 
             string person = peopleList.Items[e.Index]?.ToString() ?? string.Empty;
             bool isSelected = (e.State & DrawItemState.Selected) == DrawItemState.Selected;
+            bool isOnline = contactOnlineStates.TryGetValue(person, out bool online) && online;
+            bool isPinned = pinnedChats.Contains(person);
+            int unreadCount = unreadCounts.GetValueOrDefault(person);
+            string subtitle = GetContactSubtitle(person);
 
             Rectangle itemBounds = new Rectangle(e.Bounds.X + 4, e.Bounds.Y + 4, e.Bounds.Width - 8, e.Bounds.Height - 8);
             Color cardColor = isSelected
@@ -855,6 +887,12 @@ namespace MessagingApp
                 Rectangle avatarRect = new Rectangle(itemBounds.X + 14, itemBounds.Y + 12, 36, 36);
                 e.Graphics.FillEllipse(avatarBrush, avatarRect);
 
+                Rectangle presenceRect = new Rectangle(avatarRect.Right - 11, avatarRect.Bottom - 11, 11, 11);
+                using SolidBrush presenceBrush = new SolidBrush(isOnline ? Color.FromArgb(74, 201, 126) : BlendColors(currentSidebarMutedTextColor, currentSidebarColor, 0.3f));
+                using Pen presenceBorder = new Pen(cardColor, 2f);
+                e.Graphics.FillEllipse(presenceBrush, presenceRect);
+                e.Graphics.DrawEllipse(presenceBorder, presenceRect);
+
                 using Font initialsFont = new Font("Segoe UI Semibold", 9.5f, FontStyle.Bold);
                 TextRenderer.DrawText(
                     e.Graphics,
@@ -864,14 +902,32 @@ namespace MessagingApp
                     Color.White,
                     TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
 
-                Rectangle titleRect = new Rectangle(itemBounds.X + 62, itemBounds.Y + 10, itemBounds.Width - 74, 24);
+                int unreadBubbleWidth = 0;
+                if (unreadCount > 0)
+                {
+                    using Font unreadFont = new Font("Segoe UI", 8.5f, FontStyle.Bold);
+                    unreadBubbleWidth = Math.Max(22, TextRenderer.MeasureText(unreadCount.ToString(), unreadFont).Width + 12);
+                    Rectangle bubbleRect = new Rectangle(itemBounds.Right - unreadBubbleWidth - 12, itemBounds.Y + 18, unreadBubbleWidth, 22);
+                    using SolidBrush bubbleBrush = new SolidBrush(currentAccentColor);
+                    e.Graphics.FillEllipse(bubbleBrush, bubbleRect);
+                    TextRenderer.DrawText(
+                        e.Graphics,
+                        unreadCount.ToString(),
+                        unreadFont,
+                        bubbleRect,
+                        GetReadableTextColor(currentAccentColor),
+                        TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+                }
+
+                Rectangle titleRect = new Rectangle(itemBounds.X + 62, itemBounds.Y + 10, itemBounds.Width - 86 - unreadBubbleWidth, 24);
                 Rectangle subtitleRect = new Rectangle(itemBounds.X + 62, itemBounds.Y + 30, itemBounds.Width - 74, 22);
 
                 using Font titleFont = new Font("Segoe UI Semibold", 11f, FontStyle.Bold);
                 using Font subtitleFont = new Font("Segoe UI", 8.75f, FontStyle.Regular);
 
-                TextRenderer.DrawText(e.Graphics, person, titleFont, titleRect, currentSidebarTextColor, TextFormatFlags.EndEllipsis);
-                TextRenderer.DrawText(e.Graphics, "Open secure chat", subtitleFont, subtitleRect, subtitleColor, TextFormatFlags.EndEllipsis);
+                string titleText = isPinned ? "[Pinned] " + person : person;
+                TextRenderer.DrawText(e.Graphics, titleText, titleFont, titleRect, currentSidebarTextColor, TextFormatFlags.EndEllipsis);
+                TextRenderer.DrawText(e.Graphics, subtitle, subtitleFont, subtitleRect, subtitleColor, TextFormatFlags.EndEllipsis);
             }
 
             e.DrawFocusRectangle();

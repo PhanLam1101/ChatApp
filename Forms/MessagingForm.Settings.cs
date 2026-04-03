@@ -58,6 +58,10 @@ namespace MessagingApp
 
 	private void MessageForm_FormClosing(object? sender, FormClosingEventArgs e)
 	{
+		StopLocalTypingIndicator();
+		typingIndicatorTimer?.Stop();
+		typingStopTimer?.Stop();
+		PipeConnectionManager.OnNotificationReceived -= OnNotificationReceived;
 		PipeConnectionManager.ClosePipe();
 	}
 
@@ -80,12 +84,12 @@ namespace MessagingApp
 		bool soundEnabled = enableSoundCheckBox?.Checked ?? true;
 		bool popupEnabled = enablePopupCheckBox?.Checked ?? true;
 		bool staticPanelEnabled = enableStaticNotificationPanel?.Checked ?? false;
-		File.WriteAllText(settingFolder + "\\NotificationPreferences.txt", $"{soundEnabled},{popupEnabled},{staticPanelEnabled}");
+		File.WriteAllText(Path.Combine(settingFolder, "NotificationPreferences.txt"), $"{soundEnabled},{popupEnabled},{staticPanelEnabled}");
 	}
 
 	private void LoadNotificationPreferences()
 	{
-		string filePath = settingFolder + "\\NotificationPreferences.txt";
+		string filePath = Path.Combine(settingFolder, "NotificationPreferences.txt");
 		if (File.Exists(filePath))
 		{
 			string[] array = File.ReadAllText(filePath).Split(',');
@@ -133,7 +137,7 @@ namespace MessagingApp
 	{
 		try
 		{
-			string downloadsPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Downloads");
+			string downloadsPath = AppPaths.DownloadsDirectory;
 			if (!Directory.Exists(downloadsPath))
 			{
 				Directory.CreateDirectory(downloadsPath);
@@ -169,7 +173,8 @@ namespace MessagingApp
 		}
 		try
 		{
-			if (!File.Exists("Conversations\\" + GetConversationFileName(currentPerson, currentUserName)))
+			string conversationFile = Path.Combine(conversationFolder, GetConversationFileName(currentPerson, currentUserName));
+			if (!File.Exists(conversationFile))
 			{
 				MessageBox.Show("No conversation found for the selected contact.", "Export Failed", MessageBoxButtons.OK, MessageBoxIcon.Asterisk);
 				return;
@@ -185,7 +190,175 @@ namespace MessagingApp
 
 	private void ShowAppInfo()
 	{
-		MessageBox.Show("ChatApp Prototype Version\nDeveloped by: Group 1\nMembers: Phan Duy Lam\n         Nguyen Tran Son Tung\n         Nguyen Minh Bach\nWe hope you love it â¤\ufe0f", "About ChatApp", MessageBoxButtons.OK, MessageBoxIcon.Asterisk);
+		MessageBox.Show("ChatApp Prototype Version\nDeveloped by: Phan Duy Lam\nText chats are end-to-end encrypted in this build.\nChatBot conversations are processed on the server and are not end-to-end encrypted.", "About ChatApp", MessageBoxButtons.OK, MessageBoxIcon.Asterisk);
+	}
+
+	private bool IsChatBotContact(string? contactName)
+	{
+		return string.Equals(contactName, ChatBotContactName, StringComparison.OrdinalIgnoreCase);
+	}
+
+	private void LoadChatBotModelSettings()
+	{
+		EnsureChatBotModelsFile();
+		chatBotModels = File.ReadAllLines(AppPaths.ChatBotModelsFile)
+			.Select(ParseChatBotModelOption)
+			.Where(static option => option != null)
+			.Cast<ChatBotModelOption>()
+			.GroupBy(static option => option.ModelName, StringComparer.OrdinalIgnoreCase)
+			.Select(static group => group.First())
+			.ToList();
+
+		if (chatBotModels.Count == 0)
+		{
+			chatBotModels.Add(new ChatBotModelOption
+			{
+				DisplayName = "Gemma 3 1B",
+				ModelName = "gemma3:1b"
+			});
+		}
+
+		if (File.Exists(AppPaths.ChatBotModelSelectionFile))
+		{
+			string selectedModel = File.ReadAllText(AppPaths.ChatBotModelSelectionFile).Trim();
+			if (!string.IsNullOrWhiteSpace(selectedModel))
+			{
+				selectedChatBotModel = selectedModel;
+			}
+		}
+
+		if (!chatBotModels.Any(option => string.Equals(option.ModelName, selectedChatBotModel, StringComparison.OrdinalIgnoreCase)))
+		{
+			selectedChatBotModel = chatBotModels[0].ModelName;
+			SaveSelectedChatBotModel();
+		}
+	}
+
+	private void EnsureChatBotModelsFile()
+	{
+		string filePath = AppPaths.ChatBotModelsFile;
+		string? directory = Path.GetDirectoryName(filePath);
+		if (!string.IsNullOrWhiteSpace(directory))
+		{
+			Directory.CreateDirectory(directory);
+		}
+
+		if (!File.Exists(filePath))
+		{
+			File.WriteAllLines(filePath, new[]
+			{
+				"# One model per line in the format: Display Name|ollama-model-name",
+				"# After editing this file, open Settings > ChatBot Model > Reload Model List.",
+				"Gemma 3 270M|gemma3:270m",
+				"Gemma 3 1B|gemma3:1b"
+			});
+		}
+	}
+
+	private ChatBotModelOption? ParseChatBotModelOption(string line)
+	{
+		string trimmed = line.Trim();
+		if (string.IsNullOrWhiteSpace(trimmed) || trimmed.StartsWith("#", StringComparison.Ordinal))
+		{
+			return null;
+		}
+
+		string[] parts = trimmed.Split('|', 2);
+		string modelName = (parts.Length == 2 ? parts[1] : parts[0]).Trim();
+		if (string.IsNullOrWhiteSpace(modelName))
+		{
+			return null;
+		}
+
+		string displayName = (parts.Length == 2 ? parts[0] : parts[0]).Trim();
+		if (string.IsNullOrWhiteSpace(displayName))
+		{
+			displayName = modelName;
+		}
+
+		return new ChatBotModelOption
+		{
+			DisplayName = displayName,
+			ModelName = modelName
+		};
+	}
+
+	private void PopulateChatBotModelMenu()
+	{
+		if (chatBotModelMenu == null)
+		{
+			return;
+		}
+
+		chatBotModelMenu.DropDownItems.Clear();
+		foreach (ChatBotModelOption option in chatBotModels)
+		{
+			ToolStripMenuItem item = new ToolStripMenuItem(option.DisplayName)
+			{
+				Checked = string.Equals(option.ModelName, selectedChatBotModel, StringComparison.OrdinalIgnoreCase)
+			};
+			item.Click += (_, _) => SelectChatBotModel(option.ModelName);
+			chatBotModelMenu.DropDownItems.Add(item);
+		}
+
+		chatBotModelMenu.DropDownItems.Add(new ToolStripSeparator());
+
+		ToolStripMenuItem reloadModelsItem = new ToolStripMenuItem("Reload Model List");
+		reloadModelsItem.Click += (_, _) => ReloadChatBotModels();
+		chatBotModelMenu.DropDownItems.Add(reloadModelsItem);
+
+		ToolStripMenuItem editModelsItem = new ToolStripMenuItem("Open Models File");
+		editModelsItem.Click += (_, _) => OpenChatBotModelsFile();
+		chatBotModelMenu.DropDownItems.Add(editModelsItem);
+	}
+
+	private void ReloadChatBotModels()
+	{
+		LoadChatBotModelSettings();
+		PopulateChatBotModelMenu();
+		UpdateConversationHeader(currentPerson);
+		MessageBox.Show("ChatBot models have been reloaded from ChatBotModels.txt.", "ChatBot Models", MessageBoxButtons.OK, MessageBoxIcon.Information);
+	}
+
+	private void OpenChatBotModelsFile()
+	{
+		EnsureChatBotModelsFile();
+		try
+		{
+			Process.Start(new ProcessStartInfo
+			{
+				FileName = AppPaths.ChatBotModelsFile,
+				UseShellExecute = true
+			});
+		}
+		catch (Exception ex)
+		{
+			MessageBox.Show("Failed to open ChatBotModels.txt: " + ex.Message, "ChatBot Models", MessageBoxButtons.OK, MessageBoxIcon.Error);
+		}
+	}
+
+	private void SelectChatBotModel(string modelName)
+	{
+		if (string.IsNullOrWhiteSpace(modelName))
+		{
+			return;
+		}
+
+		selectedChatBotModel = modelName.Trim();
+		SaveSelectedChatBotModel();
+		PopulateChatBotModelMenu();
+		UpdateConversationHeader(currentPerson);
+	}
+
+	private void SaveSelectedChatBotModel()
+	{
+		File.WriteAllText(AppPaths.ChatBotModelSelectionFile, selectedChatBotModel);
+	}
+
+	private string GetSelectedChatBotModelDisplayName()
+	{
+		ChatBotModelOption? option = chatBotModels.FirstOrDefault(option => string.Equals(option.ModelName, selectedChatBotModel, StringComparison.OrdinalIgnoreCase));
+		return option?.DisplayName ?? selectedChatBotModel;
 	}
 
 	private void ChangeFont(string fontName)
@@ -236,13 +409,13 @@ namespace MessagingApp
 
 	private void SaveFontPreferences(string newFontName, float newSize)
 	{
-		using StreamWriter writer = new StreamWriter(settingFolder + "\\FontSettings.txt");
+		using StreamWriter writer = new StreamWriter(Path.Combine(settingFolder, "FontSettings.txt"));
 		writer.WriteLine($"{newFontName},{newSize}");
 	}
 
 	private void LoadFontPreferences()
 	{
-		string filePath = settingFolder + "\\FontSettings.txt";
+		string filePath = Path.Combine(settingFolder, "FontSettings.txt");
 		if (File.Exists(filePath))
 		{
 			string[] settings = File.ReadAllText(filePath).Split(',');

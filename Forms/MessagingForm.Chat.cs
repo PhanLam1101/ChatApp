@@ -34,7 +34,7 @@ namespace MessagingApp
 
 	private void InitializeFileWatcher()
 	{
-		string directoryPath = Path.GetDirectoryName(unaddedContactsFile) ?? AppDomain.CurrentDomain.BaseDirectory;
+		string directoryPath = Path.GetDirectoryName(unaddedContactsFile) ?? AppPaths.CurrentWorkspaceRoot;
 		if (!Directory.Exists(directoryPath))
 		{
 			Directory.CreateDirectory(directoryPath);
@@ -62,7 +62,9 @@ namespace MessagingApp
 			File.Create(unaddedContactsFile).Dispose();
 			MessageBox.Show("Unadded contacts file was missing and has now been created.");
 		}
-		string[] unaddedContacts = File.ReadAllLines(unaddedContactsFile);
+		string[] unaddedContacts = File.ReadAllLines(unaddedContactsFile)
+			.Where(contact => !IsChatBotContact(contact))
+			.ToArray();
 		unaddedContactsList.Items.Clear();
 		ListBox.ObjectCollection items = unaddedContactsList.Items;
 		object[] items2 = unaddedContacts;
@@ -99,6 +101,16 @@ namespace MessagingApp
 
 	private void AddContact(string contactName)
 	{
+		if (IsChatBotContact(contactName))
+		{
+			MessageBox.Show("ChatBot is already built into the app. Select it from the contact list to start chatting.", "ChatBot", MessageBoxButtons.OK, MessageBoxIcon.Information);
+			currentPerson = ChatBotContactName;
+			UpdatePeopleList();
+			LoadConversation(currentUserName, ChatBotContactName);
+			SetupFileWatcher(currentUserName, ChatBotContactName);
+			return;
+		}
+
 		foreach (object item in peopleList.Items)
 		{
 			if (string.Equals(item?.ToString(), contactName, StringComparison.Ordinal))
@@ -107,13 +119,14 @@ namespace MessagingApp
 				return;
 			}
 		}
-		string nameFile = "add_contact.bin";
+		string nameFile = AppPaths.AddContactRequestFile;
 		File.WriteAllText(nameFile, contactName);
-		if (PipeConnectionManager.PipeWriter != null)
+		StreamWriter? pipeWriter = PipeConnectionManager.PipeWriter;
+		if (pipeWriter != null)
 		{
-			PipeConnectionManager.PipeWriter.WriteLine("ADD_FRIEND");
-			PipeConnectionManager.PipeWriter.Flush();
-			string resultFilePath = "add_contact_result.bin";
+			pipeWriter.WriteLine("ADD_FRIEND");
+			pipeWriter.Flush();
+			string resultFilePath = AppPaths.AddContactResultFile;
 			Thread.Sleep(500);
 			if (File.Exists(resultFilePath))
 			{
@@ -127,6 +140,12 @@ namespace MessagingApp
 				else if (result == "fail")
 				{
 					MessageBox.Show("The contact does not exist!", "Error", MessageBoxButtons.OK, MessageBoxIcon.Hand);
+					File.Delete(resultFilePath);
+					File.Delete(nameFile);
+				}
+				else if (result == "no_key")
+				{
+					MessageBox.Show("This user exists, but they have not uploaded an encryption key yet. Ask them to sign in with the upgraded app first.", "Encryption Not Ready", MessageBoxButtons.OK, MessageBoxIcon.Warning);
 					File.Delete(resultFilePath);
 					File.Delete(nameFile);
 				}
@@ -233,6 +252,19 @@ namespace MessagingApp
 		sendMessageButtonBorder.BackColor = currentComposerColor;
 		mainMenu.BackColor = currentSurfaceColor;
 		mainMenu.ForeColor = currentTextColor;
+		if (replyPreviewPanel != null)
+		{
+			replyPreviewPanel.BackColor = BlendColors(currentComposerColor, currentAccentColor, 0.12f);
+			replyPreviewLabel.ForeColor = currentTextColor;
+			ConfigureActionButton(clearReplyButton, BlendColors(currentComposerColor, currentDangerColor, 0.2f), currentTextColor);
+		}
+
+		if (pinnedMessagePanel != null)
+		{
+			pinnedMessagePanel.BackColor = BlendColors(currentSurfaceColor, currentAccentColor, 0.06f);
+			pinnedMessageLabel.ForeColor = currentTextColor;
+			ConfigureActionButton(unpinMessageButton, BlendColors(currentSurfaceColor, currentAccentColor, 0.14f), currentTextColor);
+		}
 
 		ConfigureActionButton(sendMessageButton, currentAccentColor, GetReadableTextColor(currentAccentColor));
 		sendMessageButton.BackgroundImage = null;
@@ -339,22 +371,158 @@ namespace MessagingApp
 		return luminance > 0.6 ? Color.FromArgb(24, 34, 52) : Color.White;
 	}
 
+	private void EnsureContactState(string contactName)
+	{
+		if (string.IsNullOrWhiteSpace(contactName))
+		{
+			return;
+		}
+
+		if (!contactOnlineStates.ContainsKey(contactName))
+		{
+			contactOnlineStates[contactName] = IsChatBotContact(contactName);
+		}
+
+		if (!unreadCounts.ContainsKey(contactName))
+		{
+			unreadCounts[contactName] = 0;
+		}
+	}
+
+	private void RefreshConversationMetadata()
+	{
+		foreach (string person in people)
+		{
+			RefreshConversationMetadataForContact(person);
+		}
+	}
+
+	private string NormalizePreview(string value)
+	{
+		string singleLine = value.Replace("\r\n", " ").Replace('\n', ' ').Trim();
+		if (singleLine.Length > 60)
+		{
+			return singleLine.Substring(0, 57) + "...";
+		}
+
+		return singleLine;
+	}
+
+	private string ExtractConversationPreview(string rawMessage)
+	{
+		ParsedChatEntry entry = ParseChatEntry(rawMessage.Trim());
+		if (entry.IsControl)
+		{
+			return string.Empty;
+		}
+
+		string normalizedBody = NormalizePreview(entry.Body);
+		if (string.IsNullOrWhiteSpace(normalizedBody))
+		{
+			return entry.Sender == currentUserName ? "You sent a message" : entry.Sender + " sent a message";
+		}
+
+		return entry.Sender == currentUserName ? "You: " + normalizedBody : normalizedBody;
+	}
+
+	private void UpdateConversationPreview(string contactName, string rawMessage)
+	{
+		if (string.IsNullOrWhiteSpace(contactName))
+		{
+			return;
+		}
+
+		EnsureContactState(contactName);
+		lastMessagePreviews[contactName] = ExtractConversationPreview(rawMessage);
+	}
+
+	private void IncrementUnreadCount(string contactName)
+	{
+		if (string.IsNullOrWhiteSpace(contactName))
+		{
+			return;
+		}
+
+		EnsureContactState(contactName);
+		if (string.Equals(currentPerson, contactName, StringComparison.OrdinalIgnoreCase))
+		{
+			unreadCounts[contactName] = 0;
+			return;
+		}
+
+		unreadCounts[contactName] = unreadCounts.GetValueOrDefault(contactName) + 1;
+	}
+
+	private void MarkConversationAsRead(string contactName)
+	{
+		if (string.IsNullOrWhiteSpace(contactName))
+		{
+			return;
+		}
+
+		EnsureContactState(contactName);
+		if (unreadCounts.GetValueOrDefault(contactName) != 0)
+		{
+			unreadCounts[contactName] = 0;
+			UpdatePeopleList();
+		}
+	}
+
+	private string GetContactSubtitle(string contactName)
+	{
+		if (lastMessagePreviews.TryGetValue(contactName, out string? preview) && !string.IsNullOrWhiteSpace(preview))
+		{
+			return preview;
+		}
+
+		if (IsChatBotContact(contactName))
+		{
+			return "Server assistant | Model: " + GetSelectedChatBotModelDisplayName();
+		}
+
+		bool isOnline = contactOnlineStates.TryGetValue(contactName, out bool online) && online;
+		return isOnline ? "Online now" : "No messages yet";
+	}
+
 	private void ShowConversationPlaceholder()
 	{
+		activeConversationState = null;
+		ClearReplyTarget();
 		chatbox.Clear();
 		UpdateConversationHeader(null);
-		AppendConversationStatus("Choose a conversation on the left to start messaging.");
+		AppendConversationStatus("Choose a conversation on the left to start chatting. User chats are end-to-end encrypted.");
 	}
 
 	private void UpdateConversationHeader(string? selectedPerson)
 	{
 		bool hasSelection = !string.IsNullOrWhiteSpace(selectedPerson);
 		activeChatTitleLabel.Text = hasSelection ? selectedPerson : "Select a chat";
-		activeChatSubtitleLabel.Text = hasSelection
-			? $"Secure conversation with {selectedPerson}"
-			: "Choose a conversation from the left to start messaging.";
+		if (hasSelection)
+		{
+			if (IsChatBotContact(selectedPerson))
+			{
+				activeChatSubtitleLabel.Text = "Server-side assistant | Model: " + GetSelectedChatBotModelDisplayName() + " | Not end-to-end encrypted";
+			}
+			else
+			{
+				bool isTyping = selectedPerson != null &&
+					typingIndicators.TryGetValue(selectedPerson, out DateTime typingUntil) &&
+					typingUntil > DateTime.UtcNow;
+				bool isOnline = contactOnlineStates.TryGetValue(selectedPerson!, out bool online) && online;
+				activeChatSubtitleLabel.Text = isTyping
+					? "Typing... | End-to-end encrypted"
+					: isOnline
+						? "Online now | End-to-end encrypted"
+						: $"Offline | End-to-end encrypted with {selectedPerson}";
+			}
+		}
+		else
+		{
+			activeChatSubtitleLabel.Text = "Choose a conversation from the left to start chatting.";
+		}
 		sendMessageButton.Enabled = hasSelection;
-		sendFileButton.Enabled = hasSelection;
+		sendFileButton.Enabled = hasSelection && !IsChatBotContact(selectedPerson);
+		UpdatePinnedMessagePanel();
 	}
 
 	private void AppendConversationStatus(string message)
@@ -369,7 +537,8 @@ namespace MessagingApp
 
 	private bool TryParseChatMessage(string message, out string sender, out string timestamp, out string body)
 	{
-		Match match = Regex.Match(message, "^(?<sender>.+?) \\[(?<timestamp>[^\\]]+)\\]:\\s?(?<body>[\\s\\S]*)$");
+		TryExtractMetadata(message, out _, out string cleanMessage);
+		Match match = Regex.Match(cleanMessage, "^(?<sender>.+?) \\[(?<timestamp>[^\\]]+)\\]:\\s?(?<body>[\\s\\S]*)$");
 		if (match.Success)
 		{
 			sender = match.Groups["sender"].Value.Trim();
@@ -404,12 +573,20 @@ namespace MessagingApp
 
 	private void LoadName()
 	{
-		string friendListFilePath = "Friend_List.txt";
+		string friendListFilePath = AppPaths.FriendListFile;
 		if (!File.Exists(friendListFilePath))
 		{
 			File.Create(friendListFilePath).Close();
 		}
-		people = File.ReadAllLines(friendListFilePath).ToList();
+		people = File.ReadAllLines(friendListFilePath)
+			.Where(static line => !string.IsNullOrWhiteSpace(line))
+			.Distinct(StringComparer.OrdinalIgnoreCase)
+			.ToList();
+		if (!people.Contains(ChatBotContactName, StringComparer.OrdinalIgnoreCase))
+		{
+			people.Add(ChatBotContactName);
+		}
+		RefreshConversationMetadata();
 		UpdatePeopleList();
 		if (string.IsNullOrWhiteSpace(currentPerson))
 		{
@@ -418,7 +595,7 @@ namespace MessagingApp
 
 		friendListWatcher = new FileSystemWatcher
 		{
-			Path = AppDomain.CurrentDomain.BaseDirectory,
+			Path = Path.GetDirectoryName(friendListFilePath) ?? AppPaths.CurrentWorkspaceRoot,
 			Filter = Path.GetFileName(friendListFilePath),
 			NotifyFilter = (NotifyFilters.Size | NotifyFilters.LastWrite)
 		};
@@ -426,7 +603,15 @@ namespace MessagingApp
 		{
 			Invoke((MethodInvoker)delegate
 			{
-				people = File.ReadAllLines(friendListFilePath).ToList();
+				people = File.ReadAllLines(friendListFilePath)
+					.Where(static line => !string.IsNullOrWhiteSpace(line))
+					.Distinct(StringComparer.OrdinalIgnoreCase)
+					.ToList();
+				if (!people.Contains(ChatBotContactName, StringComparer.OrdinalIgnoreCase))
+				{
+					people.Add(ChatBotContactName);
+				}
+				RefreshConversationMetadata();
 				UpdatePeopleList();
 			});
 		};
@@ -435,31 +620,64 @@ namespace MessagingApp
 
 	private void UpdatePeopleList()
 	{
-		string filter = filterTextBox?.Text.Trim() ?? string.Empty;
-		string[] visiblePeople = string.IsNullOrWhiteSpace(filter)
-			? people.ToArray()
-			: people.Where((string person) => person.Contains(filter, StringComparison.OrdinalIgnoreCase)).ToArray();
-
-		peopleList.BeginUpdate();
-		peopleList.Items.Clear();
-		peopleList.Items.AddRange(visiblePeople);
-		peopleList.EndUpdate();
-
-		if (!string.IsNullOrWhiteSpace(currentPerson) && visiblePeople.Contains(currentPerson))
+		if (InvokeRequired)
 		{
-			peopleList.SelectedItem = currentPerson;
+			BeginInvoke((MethodInvoker)delegate
+			{
+				UpdatePeopleList();
+			});
+			return;
 		}
-		else if (!visiblePeople.Contains(currentPerson ?? string.Empty))
+
+		foreach (string person in people)
 		{
-			peopleList.ClearSelected();
+			EnsureContactState(person);
+		}
+
+		string filter = filterTextBox?.Text.Trim() ?? string.Empty;
+		IEnumerable<string> orderedPeople = people
+			.OrderByDescending((string person) => pinnedChats.Contains(person))
+			.ThenByDescending((string person) => unreadCounts.GetValueOrDefault(person))
+			.ThenByDescending((string person) => contactOnlineStates.GetValueOrDefault(person))
+			.ThenBy((string person) => person, StringComparer.OrdinalIgnoreCase);
+		string[] visiblePeople = string.IsNullOrWhiteSpace(filter)
+			? orderedPeople.ToArray()
+			: orderedPeople.Where((string person) => person.Contains(filter, StringComparison.OrdinalIgnoreCase)).ToArray();
+
+		suppressPeopleSelectionChange = true;
+		peopleList.BeginUpdate();
+		try
+		{
+			peopleList.Items.Clear();
+			peopleList.Items.AddRange(visiblePeople);
+
+			if (!string.IsNullOrWhiteSpace(currentPerson) && visiblePeople.Contains(currentPerson))
+			{
+				string? selectedValue = peopleList.SelectedItem?.ToString();
+				if (!string.Equals(selectedValue, currentPerson, StringComparison.Ordinal))
+				{
+					peopleList.SelectedItem = currentPerson;
+				}
+			}
+			else if (peopleList.SelectedItem != null)
+			{
+				peopleList.ClearSelected();
+			}
+		}
+		finally
+		{
+			peopleList.EndUpdate();
+			suppressPeopleSelectionChange = false;
 		}
 
 		int total = people.Count;
+		int onlineCount = people.Count((string person) => contactOnlineStates.GetValueOrDefault(person));
+		int unreadTotal = people.Sum((string person) => unreadCounts.GetValueOrDefault(person));
 		contactsSummaryLabel.Text = total == 0
 			? "No contacts yet"
 			: visiblePeople.Length == total
-				? $"{total} contact{(total == 1 ? string.Empty : "s")}"
-				: $"Showing {visiblePeople.Length} of {total}";
+				? $"{total} contact{(total == 1 ? string.Empty : "s")} | {onlineCount} online | {unreadTotal} unread"
+				: $"Showing {visiblePeople.Length} of {total} | {onlineCount} online | {unreadTotal} unread";
 		peopleList.Invalidate();
 	}
 
@@ -481,33 +699,13 @@ namespace MessagingApp
 			MessageBox.Show("The message contains characters that are not supported . Please check the message to use only standard characters.", "Invalid File Name", MessageBoxButtons.OK, MessageBoxIcon.Exclamation);
 			return;
 		}
-		string conversationFile = Path.Combine(conversationFolder, GetConversationFileName(currentUserName, currentPerson));
-		string timeStamp = DateTime.Now.ToString("HH:mm-dd/MM/yyyy");
-		string text = currentUserName + " [" + timeStamp + "]: ";
-		string formattedMessage = message + "\n";
-		string completedMessage = text + formattedMessage + delimiter;
-		string tempFile = "message-now.bin";
-		string sentMessage = currentPerson + "\n" + currentUserName + "\n" + completedMessage;
-		File.WriteAllText(tempFile, sentMessage);
-		File.AppendAllText(conversationFile, completedMessage + "\n");
-		Thread.Sleep(1000);
-		try
-		{
-			if (PipeConnectionManager.PipeWriter != null)
-			{
-				PipeConnectionManager.PipeWriter.WriteLine("TEXT_MESSAGE");
-				PipeConnectionManager.PipeWriter.Flush();
-			}
-			else
-			{
-				MessageBox.Show("PipeWriter is not connected.");
-			}
-		}
-		catch (Exception ex)
-		{
-			MessageBox.Show("Error communicating with C++ program: " + ex.Message);
-		}
+		string messageId = Guid.NewGuid().ToString("N");
+		string completedMessage = CreateTextMessagePayload(message, messageId);
+		SendConversationPayload(currentPerson, completedMessage, messageId);
+		MarkConversationAsRead(currentPerson);
+		StopLocalTypingIndicator();
 		messageInput.Clear();
+		ClearReplyTarget();
 		UpdateTextInfo();
 		messageInput.Focus();
 	}
@@ -518,13 +716,17 @@ namespace MessagingApp
 		{
 			MessageBox.Show("Please select a person to send a file.");
 		}
+		else if (IsChatBotContact(currentPerson))
+		{
+			MessageBox.Show("File sending is not supported for ChatBot conversations.", "ChatBot", MessageBoxButtons.OK, MessageBoxIcon.Information);
+		}
 		else
 		{
 			if (fileDialog.ShowDialog() != DialogResult.OK)
 			{
 				return;
 			}
-			string tempFile = "send-file-now.bin";
+			string tempFile = AppPaths.SendFileNowFile;
 			string filePath = fileDialog.FileName;
 			string recipient = currentPerson;
 			Path.GetFileName(filePath);
@@ -534,10 +736,11 @@ namespace MessagingApp
 				return;
 			}
 			File.WriteAllText(tempFile, recipient + "\n" + filePath);
-			if (PipeConnectionManager.PipeWriter != null)
+			StreamWriter? pipeWriter = PipeConnectionManager.PipeWriter;
+			if (pipeWriter != null)
 			{
-				PipeConnectionManager.PipeWriter.WriteLine("SEND_FILE");
-				PipeConnectionManager.PipeWriter.Flush();
+				pipeWriter.WriteLine("SEND_FILE");
+				pipeWriter.Flush();
 				MessageBox.Show("Sending file '" + filePath + "' to " + recipient);
 			}
 			else
@@ -573,10 +776,11 @@ namespace MessagingApp
 
 	private void refreshConversations(object? sender, EventArgs e)
 	{
-		if (PipeConnectionManager.PipeWriter != null)
+		StreamWriter? pipeWriter = PipeConnectionManager.PipeWriter;
+		if (pipeWriter != null)
 		{
-			PipeConnectionManager.PipeWriter.WriteLine("REFRESH");
-			PipeConnectionManager.PipeWriter.Flush();
+			pipeWriter.WriteLine("REFRESH");
+			pipeWriter.Flush();
 			currentPerson = null;
 			peopleList.ClearSelected();
 			ShowConversationPlaceholder();
@@ -591,6 +795,7 @@ namespace MessagingApp
 	private void SetupFileWatcher(string currentUser, string recipient)
 	{
 		fileWatcher?.Dispose();
+		pendingConversationChunk = string.Empty;
 		string conversationFile = Path.Combine(conversationFolder, GetConversationFileName(currentUser, recipient));
 		fileWatcher = new FileSystemWatcher
 		{
@@ -609,116 +814,79 @@ namespace MessagingApp
 	{
 		try
 		{
-			using (FileStream fs = new FileStream(conversationFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+			if (skipNextConversationWatcherChange)
 			{
-				fs.Seek(lastFileSize, SeekOrigin.Begin);
-				using StreamReader reader = new StreamReader(fs);
-				string? newLine;
-				while ((newLine = reader.ReadLine()) != null)
-				{
-					DisplayMessageInChatbox(newLine);
-				}
-				lastFileSize = fs.Length;
+				skipNextConversationWatcherChange = false;
+				return;
 			}
-			chatbox.Invoke((MethodInvoker)delegate
+
+			long newFileSize = new FileInfo(conversationFile).Length;
+			lastFileSize = newFileSize;
+
+			if (IsDisposed || !IsHandleCreated)
 			{
-				chatbox.SelectionStart = chatbox.Text.Length;
-				chatbox.ScrollToCaret();
+				return;
+			}
+
+			BeginInvoke((MethodInvoker)delegate
+			{
+				if (IsDisposed)
+				{
+					return;
+				}
+
+				if (!string.IsNullOrWhiteSpace(currentPerson))
+				{
+					RenderActiveConversation();
+					MarkConversationAsRead(currentPerson);
+					if (activeConversationState != null)
+					{
+						SendPendingReadReceipts(currentPerson, activeConversationState);
+					}
+					UpdatePeopleList();
+				}
 			});
 		}
 		catch (IOException ex)
 		{
 			Console.WriteLine("Error reading new messages: " + ex.Message);
 		}
-	}
-
-	private void DisplayMessageInChatbox(string message)
-	{
-		if (chatbox.InvokeRequired)
+		catch (ObjectDisposedException)
 		{
-			chatbox.Invoke(delegate
-			{
-				DisplayMessageInChatbox(message);
-			});
-			return;
-		}
-		try
-		{
-			if (message.EndsWith(delimiter))
-			{
-				message = message.Substring(0, message.Length - delimiter.Length);
-			}
-			if (!TryParseChatMessage(message, out string sender, out string timestamp, out string messageBody))
-			{
-				AppendConversationStatus(message.Trim());
-				return;
-			}
-
-			Color senderColor = string.Equals(sender, currentUserName, StringComparison.OrdinalIgnoreCase)
-				? currentAccentColor
-				: currentTextColor;
-
-			chatbox.SelectionStart = chatbox.TextLength;
-			chatbox.SelectionColor = senderColor;
-			chatbox.SelectionFont = new Font(fontFamily, fontSize, FontStyle.Bold);
-			chatbox.AppendText(sender);
-			chatbox.SelectionColor = currentMutedTextColor;
-			chatbox.SelectionFont = new Font(fontFamily, Math.Max(fontSize - 1f, 9f), FontStyle.Regular);
-			chatbox.AppendText("  " + timestamp + Environment.NewLine);
-			chatbox.SelectionColor = currentTextColor;
-			chatbox.SelectionFont = new Font(fontFamily, fontSize, FontStyle.Regular);
-			chatbox.AppendText(messageBody + Environment.NewLine + Environment.NewLine);
-		}
-		catch (Exception ex)
-		{
-			MessageBox.Show("Error displaying message: " + ex.Message);
 		}
 	}
 
 	private void LoadConversation(string currentUser, string recipient)
 	{
-		chatbox.Clear();
-		chatbox.Font = new Font(fontFamily, fontSize);
+		EnsureContactState(recipient);
+		InitializeConversationUiForContact(recipient);
 		UpdateConversationHeader(recipient);
 		string conversationFile = Path.Combine(conversationFolder, GetConversationFileName(currentUser, recipient));
-		if (File.Exists(conversationFile))
-		{
-			try
-			{
-				string[] messages = File.ReadAllText(conversationFile).Split(new string[1] { delimiter }, StringSplitOptions.RemoveEmptyEntries);
-				if (messages.Length != 0)
-				{
-					string[] array = messages;
-					foreach (string message in array)
-					{
-						DisplayMessageInChatbox(message.Trim());
-					}
-				}
-				else
-				{
-					AppendConversationStatus("No messages yet. Say hello to start the conversation.");
-				}
-				lastFileSize = new FileInfo(conversationFile).Length;
-			}
-			catch (Exception ex)
-			{
-				MessageBox.Show("Error loading conversation: " + ex.Message);
-			}
-		}
-		else
+		if (!File.Exists(conversationFile))
 		{
 			File.Create(conversationFile).Close();
-			AppendConversationStatus("Starting a new conversation with " + recipient + ".");
-			lastFileSize = 0L;
 		}
+
+		ConversationState state = BuildConversationState(conversationFile);
+		RenderConversationState(state);
+		lastFileSize = new FileInfo(conversationFile).Length;
+		MarkConversationAsRead(recipient);
+		SendPendingReadReceipts(recipient, state);
+		UpdatePeopleList();
 		chatbox.SelectionStart = chatbox.Text.Length;
 		chatbox.ScrollToCaret();
 	}
 
 	private void PersonSelected(object? sender, EventArgs e)
 	{
+		if (suppressPeopleSelectionChange)
+		{
+			return;
+		}
+
 		if (peopleList.SelectedItem != null)
 		{
+			StopLocalTypingIndicator();
 			string selectedPerson = peopleList.SelectedItem.ToString() ?? string.Empty;
 			currentPerson = selectedPerson;
 			LoadConversation(currentUserName, selectedPerson);
@@ -726,6 +894,7 @@ namespace MessagingApp
 		}
 		else
 		{
+			StopLocalTypingIndicator();
 			currentPerson = null;
 			ShowConversationPlaceholder();
 		}

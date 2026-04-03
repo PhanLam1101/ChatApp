@@ -36,7 +36,6 @@ namespace MessagingApp
 
 	private void LoadTemplateButtons()
 	{
-		string templatesFolder = "Templates";
 		if (!Directory.Exists(templatesFolder))
 		{
 			Directory.CreateDirectory(templatesFolder);
